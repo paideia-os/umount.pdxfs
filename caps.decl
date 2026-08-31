@@ -1,0 +1,89 @@
+# umount.pdxfs — caps.decl
+#
+# Wave: R53 (design/tooling/volume-tooling-ux.md §2.3 + §5 + §9.3, paideia-os
+# repo). umount.pdxfs is a standalone CLI tool (a ring-3 ELF with its own
+# `_start`, not a shared library like libpdx-volume/libpdx-audit): it
+# performs its own syscalls directly (self-contained inlined-syscall
+# pattern, matching src/user/true.pdx / cat.pdx / mkdir.pdx in the
+# paideia-os monorepo, and mkfs.pdxfs's own M1 landing in this same repo
+# family) rather than delegating every kernel touch to a linked library.
+#
+# consumed_kinds (kernel-owned; paideia-os repo):
+#
+#   KIND_USER              = 0x190  (src/kernel/core/cap/kind_user.pdx)
+#     -- invoker identity, consumed for audit attribution
+#        (`invoker_user` field of PdxFsUnmountRecord@0.1, §5.6). Not
+#        dereferenced by any M1 code path -- M1's --dry-run record is
+#        the task-scoped 3-field slice (target, flags, result_code);
+#        it never performs a KIND_USER lookup. Real invoker_user
+#        population lands at umount.pdxfs.M3-003 (semantic-pipe emit
+#        of the full 15-field record) alongside audit-journal
+#        attribution.
+#
+#   KIND_PDXFS_MOUNT_TABLE(read+write) = 0x1A5  (R53-PREP-001,
+#     src/kernel/core/cap/kind_pdxfs_mount_table.pdx)
+#     -- read authority to resolve a `<mount-point>` positional to a
+#        mount_id via libpdx-volume.mount_table_snapshot (§5.1,
+#        umount.pdxfs.M2-001); write authority to remove the row once
+#        the unmount completes (§5.5 step 5, umount.pdxfs.M2-003). Not
+#        invoked by any M1 code path -- M1's --dry-run branch never
+#        calls PMT_OP_READ_ROW / PMT_OP_LIST / PMT_OP_APPEND_ROW (the
+#        kind's own landed op catalog, per
+#        src/kernel/core/cap/kind_pdxfs_mount_table.pdx SECTION 6); it
+#        only inspects the raw `<mount-id | mount-point>` argv string
+#        to render the dry-run line. Real mount-point -> mount_id
+#        resolution is umount.pdxfs.M2-001.
+#
+#   KIND_VOLUME(flush+unmount, <resolved-cap>) = 0x1A0  (R52,
+#     src/kernel/core/cap/kind_volume.pdx)
+#     -- resolved by looking up the mount-table row (§5.2), not held
+#        ambiently at process start. "flush+unmount" is this design
+#        doc's own §5.2 rights label; the KIND's REAL landed op
+#        catalog (per libpdx-volume's own caps.decl in
+#        paideia-satellites/libpdx-volume) is VOL_OP_QUERY_* +
+#        VOL_OP_DEBUG_PRINT (ordinals 0..9, VK_OPS_VALID_MASK = 0x3FF)
+#        -- there is no landed "unmount" op yet, and §5.3's
+#        `VOL_OP_QUERY_HANDLE_COUNT` is itself flagged in
+#        volume-tooling-ux.md §5.3 as "a new op added by R53.M2",
+#        i.e. not yet landed kernel-side as of this M1 caps.decl. This
+#        mirrors the same "design-doc rights label vs. real landed op
+#        catalog" gap mkfs.pdxfs's own caps.decl flags for
+#        KIND_BLOCK_DEVICE -- confirm the op numbering with osarch
+#        before umount.pdxfs.M2-002 (handle-count query) and M2-003
+#        (cache-flush + checkpoint path) implement a real cap-invoke
+#        against either op. Not invoked by any M1 code path.
+#
+#   KIND_ELEVATE_CHANNEL   = 0x191  (R48b, src/kernel/core/cap/
+#     kind_elevate_channel.pdx, derived over KIND_IPC_ENDPOINT base 5)
+#     -- referenced by volume-tooling-ux.md §5.2 + §8.2 for the
+#        `--force` elevate gate (only for mount points under
+#        `/system`, `/boot`, `/dev` -- mirrors mount.pdxfs's own §4.2
+#        table). Not declared as an actively consumed kind at M1: no
+#        code path in this landing calls libpdx-elevate, which itself
+#        has not been located under paideia-satellites/ as of this
+#        landing (same "design-doc-mentioned, not yet bootstrapped"
+#        status mkfs.pdxfs's own caps.decl documents) -- see
+#        src/elevate.pdx's module header in this repo and
+#        design/architecture.md §3 for the deferral note.
+#
+# declares_output_schemas: none bound at M1. `PdxFsUnmountRecord@0.1`'s
+# FIELD SHAPE is fixed by design/tooling/volume-tooling-ux.md §5.6 (15
+# fields: audit_id, mount_id, volume_uuid, mount_point, invoker_user,
+# dirty_pages_flushed, txns_drained, journal_state, result_code,
+# open_handles, revoked_handles, deferred, ts_ns). This M1 landing's
+# --dry-run path prints a line-based textual rendering of exactly the
+# three fields this issue's own acceptance shape asks for (target,
+# flags, result_code) -- see src/unmount_record.pdx's module header for
+# which fields M1 omits and why. The typed schema-registry binding
+# (BLAKE3-truncated fingerprint constant, semantic-pipe framing) is
+# owned by umount.pdxfs.M3-003 per volume-tooling-ux.md §7.3 + §7.4, not
+# this issue.
+#
+# M1 landing status (see STATUS.md): this repo performs exactly two
+# syscalls at M1 -- `sys_write` (SC+ ID 1, to fd 1 for the dry-run
+# record and fd 2 for error diagnostics) and `sys_exit` (SC+ ID 60). No
+# sys_open, no sys_svc_lookup, no sys_ipc_send, no cap-invoke of any
+# kind -- every KIND above is declared for the SHAPE this tool's future
+# milestones consume, per the same "typed-against, not yet touched"
+# posture mkfs.pdxfs's own M1 caps.decl documents for its stub
+# functions.

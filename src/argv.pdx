@@ -1,0 +1,274 @@
+// src/argv.pdx — umount.pdxfs.M1-002 (issue #2) — argv surface
+//
+// Long-flag CLI per design/tooling/volume-tooling-ux.md §5.1:
+//
+//   umount.pdxfs [--lazy] [--force] [--verbose] [--dry-run] <mount-id | mount-point>
+//
+// libpdx-argv availability note: same status as mkfs.pdxfs's own
+// src/argv.pdx documents -- a `grep -rl libpdx-argv` across the
+// paideia-os monorepo and every repo under paideia-satellites/ (as of
+// this landing) finds zero implementation files, only a design-doc
+// mention of a planned library (design/tooling/r49-r50-plan.md §3.2).
+// Per this issue's own instruction, this file implements a MINIMAL
+// long-flag parser INLINE rather than blocking on a library that has
+// not been bootstrapped. `argv_parse`'s shape (argc/argv in, a
+// parsed-fields out-pointer, a u64 status code out) is the same shape
+// a future libpdx-argv-backed rewrite would present, so callers (just
+// src/main.pdx at M1) do not need to change at the call site if/when
+// that swap happens.
+//
+// ----------------------------------------------------------------------
+// ParsedArgv -- out-struct layout (2 u64-aligned slots, 16 bytes)
+// ----------------------------------------------------------------------
+//
+// umount.pdxfs's argv surface (§5.1) is narrower than mkfs.pdxfs's:
+// four boolean flags and exactly one positional, no value-flags
+// (`--label=`, `--journal-size=`, `--sig-key=`) at all. The out-struct
+// is therefore just two slots, not mkfs.pdxfs's five:
+//
+//   PA_OFF_FLAGS       = 0   -- bitmask, see PA_FLAG_* below
+//   PA_OFF_TARGET_PTR  = 8   -- NUL-terminated <mount-id | mount-point>
+//                               string ptr, or 0 if the caller supplied
+//                               no positional argument (main.pdx treats
+//                               0 as ARGV_ERR_MISSING_TARGET)
+//
+// Every field is a full u64 slot (never a packed narrower width) --
+// matches libpdx-volume's / mkfs.pdxfs's own "every slot a full aligned
+// u64 for simplicity of access from paideia-as" convention. The task
+// brief sketches `flags` as u32 (bit0=lazy, bit1=force, bit2=verbose,
+// bit3=dry_run); this file widens it to u64 for the same reason
+// mkfs.pdxfs's own argv.pdx widens its flags field -- paideia-as has no
+// native sub-8-byte struct-field addressing beyond raw byte offsets,
+// and a narrower flags slot would save nothing in a struct that is
+// otherwise all u64. The four bit POSITIONS themselves are kept exactly
+// as the task brief specifies (bit0=lazy, bit1=force, bit2=verbose,
+// bit3=dry_run) even though this differs from mkfs.pdxfs's own bit
+// assignment for its own (different) flag set -- there is no shared
+// contract between the two tools' flag bits to preserve.
+//
+// Distinguishing whether <target> is a decimal mount-id or a VFS path
+// is NOT this file's job: argv_parse stores the raw string pointer
+// unconditionally, exactly like mkfs.pdxfs's target_ptr. The
+// mount-id-vs-path classification (and the actual mount-point ->
+// mount_id resolution via libpdx-volume.mount_table_snapshot) is
+// umount.pdxfs.M2-001 -- M1's --dry-run path prints the raw string
+// unconditionally (per issue #3's own acceptance text), so no
+// classifier is needed here or in main.pdx at this milestone.
+//
+// ----------------------------------------------------------------------
+// Parsing strategy
+// ----------------------------------------------------------------------
+//
+// One pass over argv[1..argc). Each token is tested against the four
+// known flag literals via `argv_streq` (exact NUL-terminated equality
+// -- every umount.pdxfs flag is a bare boolean, so unlike mkfs.pdxfs's
+// argv.pdx this file needs no `argv_prefix_match` / value-flag pointer
+// arithmetic / decimal parser at all). A token matching none of the
+// four flag literals is treated as the positional <target> (last such
+// token wins if more than one appears -- same "acceptable at M1, a
+// stricter duplicate-positional error can be added later without an
+// ABI change" posture mkfs.pdxfs's own argv.pdx documents).
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline (per project-wide non-negotiable)
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. Every byte load uses the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom (paideia-as
+// #1248 workaround), matching cat.pdx / mkdir.pdx / touch.pdx and
+// mkfs.pdxfs's own src/argv.pdx. No `test` mnemonic; every zero-check
+// is `cmp reg, 0`. Reserved-label discipline: every branch label in
+// this file is prefixed `umnt_argv_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.1 (paideia-os).
+
+module Argv = structure {
+
+  // --- ParsedArgv out-struct offsets (see module header). ---------------
+  pub let PA_OFF_FLAGS       : u64 = 0
+  pub let PA_OFF_TARGET_PTR  : u64 = 8
+  pub let PA_STRUCT_BYTES    : u64 = 16
+
+  // --- ParsedArgv.flags bit assignments (task-brief-specified positions). --
+  pub let PA_FLAG_LAZY     : u64 = 0x1
+  pub let PA_FLAG_FORCE    : u64 = 0x2
+  pub let PA_FLAG_VERBOSE  : u64 = 0x4
+  pub let PA_FLAG_DRY_RUN  : u64 = 0x8
+
+  // --- argv_parse status codes. ------------------------------------------
+  pub let ARGV_OK                    : u64 = 0
+  pub let ARGV_ERR_MISSING_TARGET    : u64 = 1
+
+  // --- Flag literal storage (NUL-terminated exact-match literals; no
+  //     value-flags in this tool's argv surface, so no '='-suffixed
+  //     literals or _len constants are needed). ----------------------------
+  pub let argv_lit_lazy     : [u8; 7]  = "--lazy\0"
+  pub let argv_lit_force    : [u8; 8]  = "--force\0"
+  pub let argv_lit_verbose  : [u8; 10] = "--verbose\0"
+  pub let argv_lit_dry_run  : [u8; 10] = "--dry-run\0"
+
+  // ==========================================================================
+  // argv_streq(a_ptr, b_ptr) -> u64 (1 = equal, 0 = not equal)
+  //
+  // Standard NUL-terminated exact-equality compare. Both pointers must be
+  // NUL-terminated C strings. Pure leaf: touches only rax/rcx/rdx/rdi/rsi
+  // (all SysV caller-save), no callee-save writes, no nested call.
+  // ==========================================================================
+  pub let argv_streq : (u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64) (b_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M1-002 (#2): argv_streq entry point. Byte-loop equality compare, a_ptr in rdi, b_ptr in rsi. Each iteration: xor+mov_b loads a[i] into rcx and b[i] into rdx (zero-extended, per paideia-as #1248 workaround); cmp rcx, rdx; jne umnt_argv_streq_no on mismatch; cmp rcx, 0; je umnt_argv_streq_yes when both sides hit NUL simultaneously (rcx==rdx==0 at that point since the prior cmp did not diverge); otherwise advance both pointers and loop. Pure leaf -- rax/rcx/rdx/rdi/rsi are all SysV caller-save, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed umnt_argv_streq_. Identical shape to mkfs.pdxfs's own Argv::argv_streq (paideia-satellites/mkfs.pdxfs/src/argv.pdx).",
+      block: {
+      umnt_argv_streq_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        xor rdx, rdx;
+        mov_b rdx, [rsi];
+        cmp rcx, rdx;
+        jne umnt_argv_streq_no;
+        cmp rcx, 0;
+        je umnt_argv_streq_yes;
+        add rdi, 1;
+        add rsi, 1;
+        jmp umnt_argv_streq_loop;
+
+      umnt_argv_streq_yes:
+        mov rax, 1;
+        ret;
+
+      umnt_argv_streq_no:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // argv_parse(argc, argv, out_ptr) -> u64 (ARGV_OK | ARGV_ERR_MISSING_TARGET)
+  //
+  //   rdi = argc   (per the frozen execve ABI, design/user/execve-abi.md
+  //                 in paideia-os -- argc arrives in rdi at _start and is
+  //                 forwarded here unchanged by main.pdx)
+  //   rsi = argv   (VA of a char*[]; argv[0] is the program name and is
+  //                 skipped -- this loop starts at index 1)
+  //   rdx = out_ptr (ParsedArgv struct; PA_STRUCT_BYTES = 16 bytes,
+  //                 caller-allocated .bss per main.pdx)
+  //
+  // Register plan across the loop (all SysV callee-save; pushed on entry
+  // and popped at the shared epilogue so they survive the nested
+  // argv_streq calls):
+  //   rbx = argc
+  //   r12 = &argv[0]
+  //   r13 = out_ptr
+  //   r14 = i (loop index, starts at 1)
+  //   r15 = argv[i] (current token pointer, reloaded each iteration)
+  //
+  // Zero-init pass writes flags=0, target_ptr=0 into out_ptr BEFORE the
+  // scan loop, so a caller supplying none of the optional flags gets a
+  // well-defined zero rather than relying on .bss happening to already
+  // be zero at process start.
+  // ==========================================================================
+  pub let argv_parse : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (argc: u64) (argv: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M1-002 (#2) + M1-003 (#3): argv_parse entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) BEFORE repurposing any of them, and pops all five (in reverse order) at the single shared epilogue (umnt_argv_epilogue) before every return -- this function is a public entry point a future caller may rely on for register preservation (matching mkfs.pdxfs's own Argv::argv_parse and libpdx-audit's audit_send_record). Zero-init pass writes out.flags=0 (+0), out.target_ptr=0 (+8) before scanning. Stashes argc/argv/out_ptr/loop-index/current-token into rbx/r12/r13/r14/r15 (all now-saved SysV callee-save regs) so they survive the nested `call argv_streq` invocations below (argv_streq clobbers only caller-save registers per its own justification). Main loop (umnt_argv_scan_loop): cmp r14, rbx; jge umnt_argv_scan_done once i==argc. r15 = [r12 + r14*8] (argv[i]). Four flag checks in a fixed order (--lazy, --force, --verbose, --dry-run), each via argv_streq against its literal, each followed on a match by an `or` of the matching PA_FLAG_* bit into out.flags (+0) and a jump to umnt_argv_scan_next. A token matching none of the four is treated as the positional <target> and stored into out.target_ptr (last-token-wins on a caller passing two positionals, same posture mkfs.pdxfs's argv.pdx documents). After a match (or the positional fallthrough), umnt_argv_scan_next increments r14 and loops. After the loop: if out.target_ptr (reloaded from [r13+8]) == 0, jmp umnt_argv_missing_target which sets rax=1 (ARGV_ERR_MISSING_TARGET) and falls into the shared epilogue; else set rax=0 (ARGV_OK) and fall into the same epilogue, which pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` (every store is a plain `mov [r13+N], reg`); no `test` mnemonic. Labels prefixed umnt_argv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = argc
+        mov r12, rsi;                       // r12 = &argv[0]
+        mov r13, rdx;                       // r13 = out_ptr
+
+        // ---- Zero-init pass. ---------------------------------------------
+        xor rax, rax;
+        mov [r13 + 0], rax;                 // flags = 0
+        mov [r13 + 8], rax;                 // target_ptr = 0
+
+        mov r14, 1;                         // i = 1 (skip argv[0])
+
+      umnt_argv_scan_loop:
+        cmp r14, rbx;
+        jge umnt_argv_scan_done;
+
+        mov r15, [r12 + r14*8];             // r15 = argv[i]
+
+        // ---- --lazy (exact) -----------------------------------------------
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_lazy];
+        call argv_streq;
+        cmp rax, 0;
+        je umnt_argv_check_force;
+
+        mov rax, [r13 + 0];
+        or rax, 0x1;                        // PA_FLAG_LAZY
+        mov [r13 + 0], rax;
+        jmp umnt_argv_scan_next;
+
+      umnt_argv_check_force:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_force];
+        call argv_streq;
+        cmp rax, 0;
+        je umnt_argv_check_verbose;
+
+        mov rax, [r13 + 0];
+        or rax, 0x2;                        // PA_FLAG_FORCE
+        mov [r13 + 0], rax;
+        jmp umnt_argv_scan_next;
+
+      umnt_argv_check_verbose:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_verbose];
+        call argv_streq;
+        cmp rax, 0;
+        je umnt_argv_check_dry_run;
+
+        mov rax, [r13 + 0];
+        or rax, 0x4;                        // PA_FLAG_VERBOSE
+        mov [r13 + 0], rax;
+        jmp umnt_argv_scan_next;
+
+      umnt_argv_check_dry_run:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_dry_run];
+        call argv_streq;
+        cmp rax, 0;
+        je umnt_argv_positional;
+
+        mov rax, [r13 + 0];
+        or rax, 0x8;                        // PA_FLAG_DRY_RUN
+        mov [r13 + 0], rax;
+        jmp umnt_argv_scan_next;
+
+      umnt_argv_positional:
+        // No flag matched -- this token is the positional <target>.
+        mov [r13 + 8], r15;                 // target_ptr = token (last wins)
+
+      umnt_argv_scan_next:
+        add r14, 1;
+        jmp umnt_argv_scan_loop;
+
+      umnt_argv_scan_done:
+        mov rax, [r13 + 8];                 // reload target_ptr
+        cmp rax, 0;
+        je umnt_argv_missing_target;
+
+        xor rax, rax;                       // ARGV_OK
+        jmp umnt_argv_epilogue;
+
+      umnt_argv_missing_target:
+        mov rax, 1;                         // ARGV_ERR_MISSING_TARGET
+
+      umnt_argv_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

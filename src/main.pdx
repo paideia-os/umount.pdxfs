@@ -1,0 +1,154 @@
+// src/main.pdx — umount.pdxfs.M1-001 (scaffold) + M1-003 (#3) — _start
+//
+// umount.pdxfs is a standalone ring-3 ELF, not a library: this file is
+// its `_start` entry point, argv-wired per the frozen execve ABI
+// (design/user/execve-abi.md in the paideia-os monorepo):
+//
+//   rdi = argc, rsi = argv (VA of a char*[], own-address-space
+//   pointers -- no walker or syscall needed to dereference argv[i]),
+//   rdx = envp (unused by this tool), rsp % 16 == 0 at entry.
+//
+// M1 flow (umount.pdxfs.M1-003, issue #3):
+//
+//   1. Parse argv via Argv::argv_parse (src/argv.pdx, #2). On
+//      ARGV_ERR_MISSING_TARGET, print a usage diagnostic to fd 2 and
+//      exit 2 -- matches mkfs.pdxfs's own "missing positional is the
+//      same misuse class as a parse error" convention (design/tooling/
+//      volume-tooling-ux.md §3.2's "any other prefix is a parse error,
+//      exit 2" language for mkfs; umount's own §5 has no equivalent
+//      sentence, so this landing reuses the sibling tool's precedent
+//      rather than inventing a new exit-code convention).
+//   2. If --dry-run is set: call UnmountRecord::unmount_record_emit_
+//      dry_run (src/unmount_record.pdx, #3) to print the
+//      PdxFsUnmountRecord@0.1 line unconditionally (no target
+//      classification gate -- unlike mkfs.pdxfs's dry-run path, which
+//      gates on target_classify returning TARGET_FILE, umount.pdxfs's
+//      <mount-id | mount-point> positional has no M1 classifier: this
+//      issue's own acceptance text asks for the record to print
+//      whenever --dry-run is given, and the mount-id-vs-path
+//      resolution is umount.pdxfs.M2-001, not needed to gate M1's
+//      unconditional print), then exit 0.
+//   3. Otherwise (no --dry-run): print "umount.pdxfs: not yet
+//      implemented\n" to fd 2 and exit 1 -- the real unmount path
+//      (mount-table resolution, handle-count query, cache flush + txn
+//      drain + checkpoint, --lazy/--force handling) lands at
+//      umount.pdxfs.M2/M3 per design/tooling/volume-tooling-ux.md §9.3.
+//
+// ----------------------------------------------------------------------
+// Register plan
+// ----------------------------------------------------------------------
+//
+// All callee-save (SysV rbx/r12-r15), so they survive the two nested
+// `call`s (argv_parse, unmount_record_emit_dry_run) without any
+// push/pop -- each callee clobbers only caller-save registers per its
+// own justification, and SYSCALL preserves callee-save registers by the
+// amd64 fast-syscall convention:
+//
+//   r12 = argc (saved immediately from rdi, before any call)
+//   r13 = argv (saved immediately from rsi)
+//   r14 = &umnt_argv_out (the ParsedArgv scratch struct, lea'd once)
+//   rbx = ParsedArgv.flags (loaded once after argv_parse succeeds)
+//   r15 = ParsedArgv.target_ptr (loaded once after argv_parse succeeds)
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
+// `cmp reg, 0`. Reserved-label discipline: every branch label in this
+// file is prefixed `umnt_main_`.
+//
+// SC+ IDs used (same frozen ordinals every src/user/*.pdx binary in the
+// paideia-os monorepo uses): 1 = sys_write(fd, buf, count), 60 =
+// sys_exit(status).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5 (paideia-os);
+// design/user/execve-abi.md (paideia-os, the frozen argv ABI this
+// _start consumes).
+
+module Main = structure {
+
+  // --- ParsedArgv scratch struct (Argv::PA_STRUCT_BYTES = 16 bytes). ------
+  // .bss, zero-initialised by the loader before _start runs; argv_parse
+  // additionally writes every field explicitly so this function never
+  // reads stale/uninit bytes even on a build where .bss zero-init were
+  // somehow skipped.
+  pub let mut umnt_argv_out : [u8; 16] = uninit @align(8)
+
+  // --- Diagnostic messages (fd 2). -----------------------------------------
+  pub let umnt_msg_missing_target     : [u8; 30] = "umount.pdxfs: missing target\n\0"
+  pub let umnt_msg_missing_target_len : u64 = 29
+
+  pub let umnt_msg_not_implemented     : [u8; 35] = "umount.pdxfs: not yet implemented\n\0"
+  pub let umnt_msg_not_implemented_len : u64 = 34
+
+  // ==========================================================================
+  // _start -- user program entry point. Never returns (every terminal
+  // path ends in sys_exit).
+  // ==========================================================================
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "umount.pdxfs.M1-001 (scaffold) + M1-003 (#3): umount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&umnt_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to umnt_main_missing_target: sys_write(2, umnt_msg_missing_target, 29), sys_exit(2) -- exit code 2 reuses mkfs.pdxfs's own 'missing positional is a parse-error-class misuse' convention (design/tooling/volume-tooling-ux.md has no umount-specific sentence for this case). Phase 2 (on ARGV_OK): r14 = &umnt_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags, Argv::PA_OFF_FLAGS); r15 = [r14+8] (ParsedArgv.target_ptr, Argv::PA_OFF_TARGET_PTR). Gate: rax = rbx & 0x8 (Argv::PA_FLAG_DRY_RUN); cmp rax, 0; je umnt_main_not_implemented when --dry-run was not given. On --dry-run: rdi = r15 (target_ptr), rsi = rbx (flags); call unmount_record_emit_dry_run (src/unmount_record.pdx, #3) -- prints the PdxFsUnmountRecord@0.1 line to fd 1, unconditionally (no target-classification gate -- see module header for why this differs from mkfs.pdxfs's dry-run gating). Then sys_exit(0). umnt_main_not_implemented: sys_write(2, umnt_msg_not_implemented, 34), sys_exit(1) -- the real unmount path is umount.pdxfs.M2/M3, not yet implemented. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree and mkfs.pdxfs's own main.pdx. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed umnt_main_.",
+      block: {
+        mov r12, rdi;                       // r12 = argc
+        mov r13, rsi;                       // r13 = argv
+
+        // ---- Phase 1: parse argv. ----------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        lea rdx, [rip + umnt_argv_out];
+        call argv_parse;
+
+        cmp rax, 0;                          // ARGV_OK
+        je umnt_main_argv_ok;
+
+        // ---- ARGV_ERR_MISSING_TARGET ---------------------------------------
+        mov rdi, 2;                          // fd = stderr
+        lea rsi, [rip + umnt_msg_missing_target];
+        mov rdx, 29;                         // umnt_msg_missing_target_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+        mov rdi, 2;                          // status = 2 (invalid argument)
+        mov rax, 60;                         // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
+      umnt_main_argv_ok:
+        lea r14, [rip + umnt_argv_out];      // r14 = &ParsedArgv
+
+        mov rbx, [r14 + 0];                  // rbx = flags (Argv::PA_OFF_FLAGS)
+        mov r15, [r14 + 8];                  // r15 = target_ptr (Argv::PA_OFF_TARGET_PTR)
+
+        // ---- Gate: --dry-run set? (Argv::PA_FLAG_DRY_RUN = 0x8) -----------
+        mov rax, rbx;
+        and rax, 0x8;
+        cmp rax, 0;
+        je umnt_main_not_implemented;
+
+        // ---- --dry-run: emit the dry-run unmount record. -------------------
+        mov rdi, r15;                        // target_ptr
+        mov rsi, rbx;                        // flags
+        call unmount_record_emit_dry_run;
+
+        xor rdi, rdi;                        // status = 0 (OK)
+        mov rax, 60;                          // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
+      umnt_main_not_implemented:
+        mov rdi, 2;                          // fd = stderr
+        lea rsi, [rip + umnt_msg_not_implemented];
+        mov rdx, 34;                         // umnt_msg_not_implemented_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+        mov rdi, 1;                          // status = 1
+        mov rax, 60;                          // SC+ ID 60 = sys_exit
+        syscall;
+        hlt
+      }
+    }
+}

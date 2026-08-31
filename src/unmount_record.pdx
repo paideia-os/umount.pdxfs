@@ -1,0 +1,253 @@
+// src/unmount_record.pdx — umount.pdxfs.M1-001 (scaffold) + M1-003 (#3)
+// PdxFsUnmountRecord@0.1 emitter.
+//
+// design/tooling/volume-tooling-ux.md §5.6 defines the FULL
+// PdxFsUnmountRecord@0.1 schema: audit_id, mount_id, volume_uuid,
+// mount_point, invoker_user, dirty_pages_flushed, txns_drained,
+// journal_state, result_code, open_handles, revoked_handles, deferred,
+// ts_ns -- fifteen fields (counting `flags` is NOT one of them; see the
+// note below), most of which require substrate this repo does not have
+// at M1: a real mount-table lookup (umount.pdxfs.M2-001) for mount_id /
+// volume_uuid / mount_point, a handle-count query
+// (KIND_VOLUME.VOL_OP_QUERY_HANDLE_COUNT, umount.pdxfs.M2-002) for
+// open_handles, a KIND_USER lookup (umount.pdxfs.M3-*) for
+// invoker_user, a real clock read for ts_ns, and the cache-flush +
+// txn-drain + checkpoint sequence (§5.5, umount.pdxfs.M2-003) for
+// dirty_pages_flushed / txns_drained / journal_state.
+//
+// What THIS file emits at M1 is the exact three-field slice this
+// issue's own acceptance text asks for -- a line-based, human-readable
+// rendering on stdout of:
+//
+//   PdxFsUnmountRecord@0.1 { target: <target>, flags: <flags>,
+//                            result_code: DRY_RUN }
+//
+// This is a REAL body, not a placeholder-value stub: `target` is the
+// caller's actual raw <mount-id | mount-point> argv string
+// (unclassified -- see argv.pdx's module header for why no
+// mount-id-vs-path resolution happens at M1) and `flags` is a real
+// decimal conversion of the caller's actual ParsedArgv.flags bitmask.
+// `result_code` is always the literal `DRY_RUN` -- this module has no
+// other caller at M1 (main.pdx only reaches unmount_record_emit_
+// dry_run on the --dry-run branch).
+//
+// Note on `flags` vs. the §5.6 schema: `flags` as printed here is
+// umount.pdxfs's own ParsedArgv bitmask (Argv::PA_FLAG_*, argv.pdx),
+// NOT a field the upstream §5.6 schema itself defines -- the real
+// schema has no `flags` field (mount-time flags like RO/NOEXEC belong
+// to PdxFsMountRecord@0.1, not the unmount record). This issue's own
+// task-brief print-line explicitly asks for `target`/`flags`/
+// `result_code`, so this M1 slice prints exactly that trio; the real
+// 15-field semantic-pipe emit at umount.pdxfs.M3-003 supersedes this
+// text line entirely and does not carry `flags` forward as a distinct
+// wire field (each caller-supplied argv flag instead feeds a
+// corresponding real field: --lazy -> deferred/PENDING result_code,
+// --force -> revoked_handles population, per §5.6).
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. Every byte load uses the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom. Byte STORES
+// (e.g. `mov al, 0x30; mov [rsp], al`) are unaffected by the paideia-as
+// #1248 load-side gap and use plain sub-register movs, matching
+// src/user/init.pdx's print_u64_dec in the paideia-os monorepo and
+// mkfs.pdxfs's own src/format_record.pdx (the precedent this file's
+// decimal-conversion loop is adapted from). No `test` mnemonic; every
+// zero-check is `cmp reg, 0`. No `imul`/`mul` (the decimal conversion
+// only ever DIVIDES by the compile-time constant 10 via `div`, which is
+// unaffected by this codebase's imul-avoidance convention -- that
+// convention is about MULTIPLYING by a compile-time constant, not
+// dividing). Reserved-label discipline: every branch label in this file
+// is prefixed `umnt_ur_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.6 (paideia-os);
+// src/user/init.pdx print_u64_dec (paideia-os monorepo, the decimal-
+// conversion precedent); mkfs.pdxfs/src/format_record.pdx (the sibling
+// tool's own M1 record-emitter, whose shape this file mirrors).
+
+module UnmountRecord = structure {
+
+  // --- Literal chunks of the printed line. Lengths are exact byte
+  //     counts (verified via `python3 -c "print(len(...))"` against
+  //     each literal below), not counting any trailing NUL the storage
+  //     array happens to add. -----------------------------------------
+  pub let ur_lit_prefix     : [u8; 34] = "PdxFsUnmountRecord@0.1 { target: \0"
+  pub let ur_lit_prefix_len : u64 = 33
+
+  pub let ur_lit_flags     : [u8; 10] = ", flags: \0"
+  pub let ur_lit_flags_len : u64 = 9
+
+  pub let ur_lit_suffix     : [u8; 26] = ", result_code: DRY_RUN }\n\0"
+  pub let ur_lit_suffix_len : u64 = 25
+
+  // ==========================================================================
+  // unmount_record_strlen(s) -> u64
+  //
+  // Byte-loop strlen, identical shape to src/user/string.pdx's strlen in
+  // the paideia-os monorepo and mkfs.pdxfs's own format_record_strlen.
+  // Carries its own copy rather than a cross-module call, same
+  // "no link-order dependency for one loop" posture mkfs.pdxfs's
+  // format_record.pdx documents. Pure leaf: rax/rcx/rdi are SysV
+  // caller-save.
+  // ==========================================================================
+  pub let unmount_record_strlen : (u64) -> u64 !{mem} @{} =
+    fn (s: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M1-001/M1-003: unmount_record_strlen entry point. s in rdi. Loop: xor+mov_b loads *s into rcx (zero-extended); cmp rcx, 0; je umnt_ur_strlen_done on NUL; else add rax,1 (counter) and add rdi,1 (cursor), loop. Pure leaf -- rax/rcx/rdi all SysV caller-save, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed umnt_ur_strlen_.",
+      block: {
+        xor rax, rax;
+
+      umnt_ur_strlen_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0;
+        je umnt_ur_strlen_done;
+        add rax, 1;
+        add rdi, 1;
+        jmp umnt_ur_strlen_loop;
+
+      umnt_ur_strlen_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // unmount_record_emit_dry_run(target_ptr, flags) -> ()
+  //
+  //   rdi = target_ptr  (NUL-terminated <mount-id | mount-point> string,
+  //                       e.g. ParsedArgv.target_ptr)
+  //   rsi = flags       (u64 ParsedArgv.flags bitmask; see argv.pdx's
+  //                       PA_FLAG_* constants)
+  //
+  // Writes exactly one line to fd 1 (stdout) via a fixed sequence of
+  // sys_write calls, one per literal-or-dynamic segment -- same
+  // "several small sys_write calls in sequence rather than one
+  // buffer-assembly pass" convention mkfs.pdxfs's format_record_emit_
+  // dry_run and cat.pdx's cat_open_err use. Segments, in wire order:
+  //   1. ur_lit_prefix   "PdxFsUnmountRecord@0.1 { target: "
+  //   2. target_ptr, length via unmount_record_strlen
+  //   3. ur_lit_flags    ", flags: "
+  //   4. flags, decimal-converted via an inline div-by-10 loop into a
+  //      24-byte stack scratch buffer (identical algorithm to
+  //      mkfs.pdxfs's format_record_emit_dry_run's journal_size
+  //      segment, itself adapted from src/user/init.pdx's
+  //      print_u64_dec in the paideia-os monorepo)
+  //   5. ur_lit_suffix   ", result_code: DRY_RUN }\n"
+  //
+  // Never returns an error code -- sys_write's return value is ignored
+  // on every call, matching mkfs.pdxfs's own posture at this maturity.
+  // Caller (main.pdx) calls sys_exit itself after this returns.
+  //
+  // Register plan. rbx/r13 are SysV callee-save and are explicitly
+  // saved (push) on entry and restored (pop) before the single `ret` --
+  // this function is a public entry point a future caller may rely on
+  // for register preservation (matching mkfs.pdxfs's format_record_
+  // emit_dry_run and libpdx-audit's audit_send_record):
+  //   rbx = target_ptr  (held across segment 2's nested call)
+  //   r13 = flags       (held across segments 1-3, consumed at segment 4)
+  //
+  // No r12/r14 is needed: unlike mkfs.pdxfs's three-dynamic-value
+  // record (target + optional label + journal_size), this record has
+  // only two dynamic values, so two callee-save registers suffice.
+  // unmount_record_strlen touches only rax/rcx/rdi (its own
+  // justification), never rsi/rdx, so its return value in rax is moved
+  // directly into rdx for the very next sys_write rather than being
+  // stashed in a third callee-save register first.
+  // ==========================================================================
+  pub let unmount_record_emit_dry_run : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (flags: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "umount.pdxfs.M1-003 (#3): unmount_record_emit_dry_run entry point. SysV callee-save discipline: push rbx; push r13 (2 registers, 16 bytes) BEFORE repurposing either -- pops occur in reverse order immediately before the single `ret`. rbx=target_ptr, r13=flags, both now-saved SysV callee-save registers that survive the nested `call unmount_record_strlen` invocation and the several `syscall` instructions below (unmount_record_strlen clobbers only caller-save registers per its own justification; SYSCALL preserves callee-save registers by the amd64 fast-syscall convention, even though the kernel's #743 info-leak hardening zeroes rdi/rsi/rdx/r8/r9/r10 -- all caller-save -- before every sysret, which is exactly why this function reloads rdi/rsi/rdx fresh before every syscall rather than assuming any of them survive one). Segment 1: sys_write(1, ur_lit_prefix, 33) -- SC+ ID 1, rdi=fd, rsi=buf (rip-relative lea), rdx=count, rax=1, syscall. Segment 2: call unmount_record_strlen(rbx) -> rax = len, moved directly into rdx (no third callee-save register needed -- unmount_record_strlen never touches rsi/rdx); sys_write(1, rbx, rdx). Segment 3: sys_write(1, ur_lit_flags, 9). Segment 4: `sub rsp, 24` scratch (24 = 20 digit-buffer bytes + 4 alignment slop, matching mkfs.pdxfs's own sizing) then a zero-value special case (r13 == 0 writes a single '0' byte) or the general div-by-10 loop: r9 = remaining value, r10 = cursor starting at rsp+19 and walking DOWN (writes digits most-significant-last, so the final [cursor, rsp+20) slice is already MSB-first with no separate reversal pass -- identical algorithm to mkfs.pdxfs's format_record_emit_dry_run journal_size segment). `add rsp, 24` restores the stack after the digit sys_write. Segment 5: sys_write(1, ur_lit_suffix, 25). Pops r13/rbx (reverse push order) and returns (no value; caller sys_exits itself). No `add reg,[mem]` (the digit-count computation `mov rax,rsp; add rax,20; sub rax,r10` operates on registers only, never adding a memory operand). No `test` mnemonic. No `imul`/`mul` -- only `div` by the compile-time constant 10. Labels prefixed umnt_ur_.",
+      block: {
+        push rbx;
+        push r13;
+
+        mov rbx, rdi;                       // rbx = target_ptr
+        mov r13, rsi;                       // r13 = flags
+
+        // ---- Segment 1: "PdxFsUnmountRecord@0.1 { target: " -------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_prefix];
+        mov rdx, 33;                        // ur_lit_prefix_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        // ---- Segment 2: target string --------------------------------------
+        mov rdi, rbx;
+        call unmount_record_strlen;
+        mov rdx, rax;                       // rdx = target_len
+        mov rdi, 1;
+        mov rsi, rbx;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 3: ", flags: " ---------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_flags];
+        mov rdx, 9;                         // ur_lit_flags_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 4: flags, decimal --------------------------------------
+        sub rsp, 24;
+
+        cmp r13, 0;
+        jne umnt_ur_flags_setup;
+
+        // Zero special case: single '0' digit.
+        mov al, 0x30;
+        mov [rsp], al;
+        mov rdi, 1;
+        mov rsi, rsp;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        jmp umnt_ur_flags_done;
+
+      umnt_ur_flags_setup:
+        mov r9, r13;                        // r9 = remaining value
+        mov r10, rsp;
+        add r10, 19;                        // r10 = cursor at last staging byte
+
+      umnt_ur_flags_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                       // zero-extend rdx:rax for div
+        div rcx;                            // rax = quotient, rdx = remainder
+        add rdx, 0x30;                      // digit -> ASCII '0'..'9'
+        mov [r10], dl;                      // store at cursor
+        mov r9, rax;                        // r9 = quotient
+        cmp r9, 0;
+        je umnt_ur_flags_emit;
+        sub r10, 1;                         // advance cursor left (MSB-ward)
+        jmp umnt_ur_flags_loop;
+
+      umnt_ur_flags_emit:
+        // r10 points at the first (MSB) digit. Length = (rsp + 20) - r10.
+        mov rax, rsp;
+        add rax, 20;
+        sub rax, r10;                       // rax = digit count
+        mov rdx, rax;                       // sys_write count
+        mov rdi, 1;                         // fd
+        mov rsi, r10;                       // buf
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+      umnt_ur_flags_done:
+        add rsp, 24;
+
+        // ---- Segment 5: ", result_code: DRY_RUN }\n" ------------------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_suffix];
+        mov rdx, 25;                        // ur_lit_suffix_len
+        mov rax, 1;
+        syscall;
+
+        pop r13;
+        pop rbx;
+        ret;
+      }
+    }
+}

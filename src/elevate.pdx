@@ -1,0 +1,55 @@
+// src/elevate.pdx — umount.pdxfs.M1-001 (scaffold) — elevate placeholder
+//
+// design/tooling/volume-tooling-ux.md §5.2 + §8.2 describe umount.pdxfs's
+// `--force` gate: forcing an unmount past the "handles still open"
+// refusal (§5.3) requires a `KIND_ELEVATE_CHANNEL` grant when the
+// resolved mount point falls under `/system`, `/boot`, or `/dev`
+// (mirrors mount.pdxfs's own §4.2 mount-point-class table). This file
+// is the placeholder this issue's own instruction names for that future
+// work -- it declares no live entry point at M1, since:
+//
+//   (a) main.pdx never reaches a --force code path at M1 (the only
+//       branches wired are the argv-missing-target diagnostic, the
+//       --dry-run record emit, and the generic "not yet implemented"
+//       fallthrough -- --force is parsed into ParsedArgv.flags by
+//       argv.pdx but never inspected by main.pdx's M1 _start), and
+//   (b) `libpdx-elevate` has not been located anywhere under
+//       paideia-satellites/ as of this landing (a `grep -rl
+//       libpdx-elevate` across the paideia-os monorepo and every
+//       satellite repo finds zero implementation files) -- the same
+//       "design-doc-mentioned, not yet bootstrapped" status
+//       mkfs.pdxfs's own design/architecture.md §9 documents for
+//       `libpdx-elevate` ahead of that tool's own M3-005. See
+//       design/architecture.md §3 in this repo for the full note.
+//
+// What lands here, and when:
+//
+//   umount.pdxfs.M3-002 ("--force path: libpdx-elevate + handle-revoke
+//   + revoked_handles list in record") is where this file grows a real
+//   `elevate_request_force_unmount(mount_point_ptr) -> u64` entry point
+//   -- requesting a `KIND_ELEVATE_CHANNEL` grant scoped to the resolved
+//   mount point, blocking (or consulting the `elevate_policy.pdx`
+//   auto-approve table per §8.2) until APPROVED/DENIED/EXPIRED, and
+//   returning a status main.pdx gates the handle-revoke sequence on. If
+//   `libpdx-elevate` still does not exist by the time M3-002 opens,
+//   this file implements a minimal inline fallback instead (same
+//   "check for the library, ship inline if absent" posture argv.pdx
+//   takes for `libpdx-argv` at M1) -- confirm with main before that
+//   issue opens, per design/architecture.md §3's own flag.
+//
+// No executable code in this file at M1 -- only the scope note above
+// and the elevate-channel kind reference below, kept here (rather than
+// only in caps.decl) so a reader of src/ finds the deferred entry
+// point's future home without having to cross-reference caps.decl.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.2 + §8.2 (paideia-os).
+
+module Elevate = structure {
+
+  // KIND_ELEVATE_CHANNEL = 0x191 (src/kernel/core/cap/kind_elevate_channel.pdx,
+  // R48b, derived over KIND_IPC_ENDPOINT base 5). Referenced here purely
+  // as documentation cross-reference for the future M3-002 entry point;
+  // not consumed by any M1 code path (see caps.decl's own note on the
+  // same kind).
+  pub let KIND_ELEVATE_CHANNEL_REF : u64 = 0x191
+}
