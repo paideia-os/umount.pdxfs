@@ -1,0 +1,194 @@
+// src/unmount_op.pdx — umount.pdxfs.M2-003 (issue #6)
+// Non-force happy path: sys_umount + cache-flush/txn-drain +
+// CLEAN checkpoint + superblock re-sign + row remove.
+//
+// design/tooling/volume-tooling-ux.md §5.5 sketches six steps. This
+// file drives all six; per this issue's own instruction, every
+// substep that has no landed kernel/library primitive STUBS gracefully
+// (documented, mask bit set) rather than aborting the pipeline —
+// **only a genuine sys_umount error aborts** (see step 1).
+//
+// ----------------------------------------------------------------------
+// Step 1 — sys_umount: a REAL syscall to a syscall number dispatch
+// never wires to a body
+// ----------------------------------------------------------------------
+//
+// `src/kernel/core/syscall/sys_umount.pdx` (R53.M2-003, #1738) landed a
+// COMPLETE real body (`sys_umount_body` + `sys_umount_shim`) months
+// ago. But `src/kernel/core/syscall/dispatch.pdx`'s `dispatch_umount`
+// label (sysno 76 — confirmed via the R51.M8-001 comment trail: sysno
+// 74 = blkdev_cap_request, 75 = sys_mount, 76 = sys_umount) is STILL
+// the original R53.M2-001 (#1736) forward-declaration stub:
+//
+//     dispatch_umount:
+//     mov rax, 0xFFFFFFFFFFFFFFDA;   // -ENOSYS (stub; body lands in #1738)
+//     ret;
+//
+// #1738 landed `sys_umount_body` but never rewired `dispatch_umount`'s
+// label to tail-call `sys_umount_shim` — an unwired-primitive gap, not
+// a source-absence one. **Flagged for main**: `dispatch_umount` needs
+// a one-block rewrite (mirroring `dispatch_open`'s KPTI-bounce shape,
+// per dispatch.pdx's own #1736 comment) before `sys_umount` is
+// reachable from ring 3 at all, regardless of what any caller passes.
+//
+// This file issues the REAL syscall anyway — `rdi=mount_id, rsi=flags,
+// rax=76, syscall` (the calling convention `dispatch_umount`'s own
+// #1736 comment documents: `rsi = a0 = mount_id, rdx = a1 = flags` at
+// the dispatch label, which — per entry.pdx's SYSCALL->SysV shuffle —
+// corresponds to the user-side raw syscall setting rdi=a0, rsi=a1,
+// exactly like every other syscall in this repo, e.g. sys_write's
+// rdi=fd/rsi=buf/rdx=count) — and treats the CURRENT deterministic
+// `-ENOSYS` return as a documented stub condition (bit 0 of the stub
+// mask), NOT a hard failure: per this issue's own instruction, "the
+// OVERALL happy path should still complete and emit OK" even though
+// substeps stub. Any OTHER negative return (a real errno, reachable
+// only once `dispatch_umount` is rewired) IS treated as a hard failure
+// — `UR_RC_KERNEL_ERROR`, pipeline aborts, remaining substeps skipped.
+//
+// ----------------------------------------------------------------------
+// Steps 2-5 — no landed primitive; stubbed with a mask bit each
+// ----------------------------------------------------------------------
+//
+//   Step 2 (cache flush + txn drain): no `KIND_VOLUME` op name exists
+//     for this (`VOL_OP_MAX`=9, all nine ordinals are `VOL_OP_QUERY_*`
+//     + `VOL_OP_DEBUG_PRINT` — see `src/handle_check.pdx`'s module
+//     header for the full catalog dump). No libpdx-volume entry point
+//     either. Stub bit `UO_STUB_CACHE_FLUSH` (0x2).
+//   Step 3 (CLEAN checkpoint): `design/tooling/volume-lifecycle-
+//     mechanism.md`'s WAL clean-checkpoint sequence has no landed
+//     userspace-callable entry point (kernel-internal journal state
+//     only). Stub bit `UO_STUB_CHECKPOINT` (0x4).
+//   Step 4 (superblock re-sign): `libpdx-volume.pdxb_sign_superblock`
+//     IS real (`src/pdxb_sign.pdx`, libpdx-volume.M3-001 #7) but needs
+//     a 4096-byte in-memory ENCODED superblock buffer plus a 32-byte
+//     ML-DSA-65 seed pointer — this tool has neither: no block-device
+//     read primitive is wired here, and no seed source (`sig_key_slot`
+//     resolution, per that file's own module header) exists for a
+//     ring-3 caller. Stub bit `UO_STUB_SB_RESIGN` (0x8).
+//   Step 5 (row remove): `KIND_PDXFS_MOUNT_TABLE`'s real, landed op
+//     catalog (`kind_pdxfs_mount_table.pdx`) is `PMT_OP_LIST`(0),
+//     `PMT_OP_READ_ROW`(1), `PMT_OP_APPEND_ROW`(2),
+//     `PMT_OP_QUERY_SLOT_COUNT`(3), `PMT_OP_MAX`=3 — there is no
+//     remove/delete op. Stub bit `UO_STUB_ROW_REMOVE` (0x10).
+//
+// Every stub bit fires unconditionally on the success path (steps 2-5
+// always stub; step 1's bit fires only when sys_umount returned
+// -ENOSYS). `main.pdx` forwards the accumulated mask into
+// `PdxFsUnmountRecord@0.1`'s metadata via `unmount_record_emit_result`
+// so a reader of the emitted record sees exactly which substeps ran
+// for real vs. stubbed, per this issue's own "document exactly what
+// was stubbed in the record's metadata" instruction.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
+// `cmp reg, 0`. Reserved-label discipline: every branch label in this
+// file is prefixed `umnt_op_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.5 (paideia-os);
+// src/kernel/core/syscall/sys_umount.pdx + dispatch.pdx (the unwired-
+// dispatch finding); src/kernel/core/cap/kind_pdxfs_mount_table.pdx
+// (PMT_OP_MAX=3); libpdx-volume's src/pdxb_sign.pdx (pdxb_sign_
+// superblock's real but unusable-here signature).
+
+module UnmountOp = structure {
+
+  // --- unmount_op status codes. Deliberately share numeric values with
+  //     UnmountRecord::UR_RC_OK (0) / UR_RC_KERNEL_ERROR (2) -- this
+  //     repo has no precedent for a cross-module `pub let` numeric
+  //     reference (same rationale libpdx-volume's own
+  //     mount_table_snapshot.pdx documents for its LPV_MTS_* codes). --
+  pub let UO_RC_OK            : u64 = 0
+  pub let UO_RC_KERNEL_ERROR  : u64 = 2
+
+  // --- Stub-mask bits (see module header §Steps 2-5; bit 0 is step 1's
+  //     conditional ENOSYS marker). Documented here AND mirrored in a
+  //     comment in unmount_record.pdx for a reader who only opens the
+  //     emitter. -------------------------------------------------------
+  pub let UO_STUB_SYS_UMOUNT_ENOSYS : u64 = 0x1
+  pub let UO_STUB_CACHE_FLUSH       : u64 = 0x2
+  pub let UO_STUB_CHECKPOINT        : u64 = 0x4
+  pub let UO_STUB_SB_RESIGN         : u64 = 0x8
+  pub let UO_STUB_ROW_REMOVE        : u64 = 0x10
+
+  // --- sys_umount's -ENOSYS sentinel (standard errno 38, negated). ---------
+  pub let UO_ENOSYS : u64 = 0xFFFFFFFFFFFFFFDA
+
+  // ==========================================================================
+  // unmount_op(mount_id, umount_flags, out_stub_mask_ptr) -> u64
+  //     (UO_RC_OK | UO_RC_KERNEL_ERROR)
+  //
+  //   rdi = mount_id           resolved _mount_table[] slot index
+  //                            (src/target_resolve.pdx)
+  //   rsi = umount_flags       caller-premasked ParsedArgv.flags &
+  //                            (PA_FLAG_LAZY|PA_FLAG_FORCE) -- a
+  //                            documented stand-in for the real
+  //                            UMOUNT_FLAG_* bit layout, which has not
+  //                            landed (dispatch_umount ignores this
+  //                            argument entirely today per module
+  //                            header, so no real layout can be wrong
+  //                            yet; this mapping is forward-looking)
+  //   rdx = out_stub_mask_ptr  u64 write target; ALWAYS written,
+  //                            both on UO_RC_OK and UO_RC_KERNEL_ERROR
+  //
+  // Register plan: r12 = out_stub_mask_ptr, r13 = stub_mask
+  // accumulator (both SysV callee-save, pushed on entry / popped
+  // before the single `ret` since this is a public entry point).
+  // rdi/rsi are consumed directly as the syscall's own arg registers
+  // (already in the correct SysV positions at entry -- no re-mov
+  // needed) and are safe to hold across the `syscall` instruction per
+  // the amd64 fast-syscall convention (callee-save regs survive;
+  // rdi/rsi/rdx/r8/r9/r10 are zeroed by the kernel's #743 info-leak
+  // hardening on return, which is exactly why out_stub_mask_ptr is
+  // moved into a callee-save register BEFORE the syscall).
+  // ==========================================================================
+  pub let unmount_op : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (mount_id: u64) (umount_flags: u64) (out_stub_mask_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "umount.pdxfs.M2-003 (#6): unmount_op entry point. SysV callee-save discipline: push r12; push r13 before repurposing either, popped in reverse order before the single `ret`. r12 = out_stub_mask_ptr (rdx), r13 = stub_mask accumulator (xor-zeroed). rdi/rsi already hold mount_id/umount_flags in the exact positions the raw syscall needs (module header's §Step 1 calling-convention note), so `mov rax,76; syscall;` issues the real sys_umount attempt with no further register shuffle. Post-syscall: stage UO_ENOSYS (0xFFFFFFFFFFFFFFDA) into r10 (64-bit sentinel, movabs-class immediate per this repo's staged-compare convention for values outside cmp-imm32 range) and `cmp rax,r10; je umnt_op_umount_enosys` -- the CURRENT deterministic outcome (dispatch_umount is unwired, module header). On that branch, `or r13,0x1` (UO_STUB_SYS_UMOUNT_ENOSYS) and fall through to the success path. Otherwise `cmp rax,0; je umnt_op_umount_ok` (a real future success, once dispatch_umount is rewired); any OTHER value is a genuine kernel error -- `mov [r12+0],r13` (write whatever stub bits are set so far, i.e. none from step 1 on this arm), `mov rax,2` (UO_RC_KERNEL_ERROR), jump to the shared epilogue, SKIPPING steps 2-5 entirely (a genuine umount failure must not proceed to cache-flush/checkpoint/re-sign/row-remove against a volume the kernel just refused to unmount). Success path (umnt_op_umount_ok, reached either via ENOSYS-stub or real 0 return): steps 2-5 each unconditionally `or r13,<bit>` per module header's §Steps 2-5 (UO_STUB_CACHE_FLUSH=0x2, UO_STUB_CHECKPOINT=0x4, UO_STUB_SB_RESIGN=0x8, UO_STUB_ROW_REMOVE=0x10) -- no kernel/library primitive exists for any of them, so there is nothing to call, only the mask bit to record. `mov [r12+0],r13` writes the final mask; `xor rax,rax` (UO_RC_OK); fall into the shared epilogue. Epilogue pops r13/r12 (reverse push order) and returns. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed umnt_op_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdx;                       // r12 = out_stub_mask_ptr
+        xor r13, r13;                       // r13 = stub_mask = 0
+
+        // ---- Step 1: real sys_umount attempt (sysno 76). -------------------
+        // rdi = mount_id, rsi = umount_flags already in place.
+        mov rax, 76;                        // SC+ ID 76 = sys_umount(mount_id, flags)
+        syscall;
+
+        mov r10, 0xFFFFFFFFFFFFFFDA;        // UO_ENOSYS sentinel
+        cmp rax, r10;
+        je umnt_op_umount_enosys;
+
+        cmp rax, 0;
+        je umnt_op_umount_ok;
+
+        // ---- Genuine kernel error: abort, skip steps 2-5. -------------------
+        mov [r12 + 0], r13;                 // *out_stub_mask_ptr = stub_mask so far
+        mov rax, 2;                         // UO_RC_KERNEL_ERROR
+        jmp umnt_op_epilogue;
+
+      umnt_op_umount_enosys:
+        or r13, 0x1;                        // UO_STUB_SYS_UMOUNT_ENOSYS
+
+      umnt_op_umount_ok:
+        // ---- Steps 2-5: no landed primitive; stub each (see header). -------
+        or r13, 0x2;                        // UO_STUB_CACHE_FLUSH
+        or r13, 0x4;                        // UO_STUB_CHECKPOINT
+        or r13, 0x8;                        // UO_STUB_SB_RESIGN
+        or r13, 0x10;                       // UO_STUB_ROW_REMOVE
+
+        mov [r12 + 0], r13;                 // *out_stub_mask_ptr = stub_mask
+        xor rax, rax;                       // UO_RC_OK
+
+      umnt_op_epilogue:
+        pop r13;
+        pop r12;
+        ret;
+      }
+    }
+}

@@ -20,33 +20,61 @@
 //      rather than inventing a new exit-code convention).
 //   2. If --dry-run is set: call UnmountRecord::unmount_record_emit_
 //      dry_run (src/unmount_record.pdx, #3) to print the
-//      PdxFsUnmountRecord@0.1 line unconditionally (no target
-//      classification gate -- unlike mkfs.pdxfs's dry-run path, which
-//      gates on target_classify returning TARGET_FILE, umount.pdxfs's
-//      <mount-id | mount-point> positional has no M1 classifier: this
-//      issue's own acceptance text asks for the record to print
-//      whenever --dry-run is given, and the mount-id-vs-path
-//      resolution is umount.pdxfs.M2-001, not needed to gate M1's
-//      unconditional print), then exit 0.
-//   3. Otherwise (no --dry-run): print "umount.pdxfs: not yet
-//      implemented\n" to fd 2 and exit 1 -- the real unmount path
-//      (mount-table resolution, handle-count query, cache flush + txn
-//      drain + checkpoint, --lazy/--force handling) lands at
-//      umount.pdxfs.M2/M3 per design/tooling/volume-tooling-ux.md §9.3.
+//      PdxFsUnmountRecord@0.1 line unconditionally, then exit 0.
+//
+// M2 flow (umount.pdxfs.M2-001/002/003, issues #4/#5/#6) -- reached
+// whenever --dry-run is NOT set:
+//
+//   3. TargetResolve::target_resolve (src/target_resolve.pdx, #4)
+//      resolves the raw <mount-id | mount-point> string to a mount_id.
+//      On TR_ERR_MOUNT_NOT_FOUND (every path-shaped target at M2 --
+//      see that file's own module header for why), emit a
+//      MOUNT_NOT_FOUND record and exit 3.
+//   4. HandleCheck::handle_check_refuse (src/handle_check.pdx, #5)
+//      checks the (currently hard-stubbed, always-zero) open-handle
+//      count against --force. On HC_REFUSE, emit an IN_USE record and
+//      exit 5. Unreachable at M2 (the stub never returns nonzero) but
+//      real, live gating logic -- see that file's module header.
+//   5. UnmountOp::unmount_op (src/unmount_op.pdx, #6) drives the real
+//      sys_umount syscall attempt plus four stubbed substeps (cache
+//      flush, checkpoint, superblock re-sign, row remove), returning
+//      UO_RC_OK or UO_RC_KERNEL_ERROR plus an accumulated stub_mask.
+//      Emit the resulting record (OK or KERNEL_ERROR) and exit 0 or 6.
+//
+// ----------------------------------------------------------------------
+// Exit-code table (this file's own convention; no upstream table pins
+// these numbers, so they are chosen here and documented for whoever
+// scripts against this tool next)
+// ----------------------------------------------------------------------
+//
+//   0 = OK (dry-run print, or a real unmount that completed -- possibly
+//       with stubbed substeps; see PdxFsUnmountRecord@0.1's stub_mask)
+//   2 = ARGV_ERR_MISSING_TARGET (no positional given)
+//   3 = MOUNT_NOT_FOUND (target_resolve could not resolve the target)
+//   5 = IN_USE (handle_check_refuse refused; matches this issue's own
+//       "IN_USE refusal (exit 5)" instruction verbatim)
+//   6 = KERNEL_ERROR (sys_umount returned a genuine non-ENOSYS error)
 //
 // ----------------------------------------------------------------------
 // Register plan
 // ----------------------------------------------------------------------
 //
-// All callee-save (SysV rbx/r12-r15), so they survive the two nested
-// `call`s (argv_parse, unmount_record_emit_dry_run) without any
-// push/pop -- each callee clobbers only caller-save registers per its
-// own justification, and SYSCALL preserves callee-save registers by the
-// amd64 fast-syscall convention:
+// All callee-save (SysV rbx/r12-r15), so they survive every nested
+// `call` without extra push/pop -- each callee clobbers only
+// caller-save registers per its own justification (or, for
+// unmount_record_emit_result / unmount_op, pushes/pops its own
+// callee-save use internally), and SYSCALL preserves callee-save
+// registers by the amd64 fast-syscall convention:
 //
 //   r12 = argc (saved immediately from rdi, before any call)
-//   r13 = argv (saved immediately from rsi)
-//   r14 = &umnt_argv_out (the ParsedArgv scratch struct, lea'd once)
+//   r13 = argv (saved immediately from rsi), REPURPOSED after argv_ok
+//         to hold the resolved mount_id across the M2 pipeline (argv
+//         is dead by then -- argv_parse already copied everything it
+//         needs out of it into umnt_argv_out)
+//   r14 = &umnt_argv_out (the ParsedArgv scratch struct, lea'd once),
+//         REPURPOSED after the dry-run gate to hold unmount_op's
+//         UO_RC_* result code across the emit call (umnt_argv_out's
+//         fields are already loaded into rbx/r15 by then)
 //   rbx = ParsedArgv.flags (loaded once after argv_parse succeeds)
 //   r15 = ParsedArgv.target_ptr (loaded once after argv_parse succeeds)
 //
@@ -64,7 +92,9 @@
 //
 // Upstream: design/tooling/volume-tooling-ux.md §5 (paideia-os);
 // design/user/execve-abi.md (paideia-os, the frozen argv ABI this
-// _start consumes).
+// _start consumes); src/target_resolve.pdx, src/handle_check.pdx,
+// src/unmount_op.pdx (this repo, the three M2 modules this file wires
+// together).
 
 module Main = structure {
 
@@ -79,8 +109,10 @@ module Main = structure {
   pub let umnt_msg_missing_target     : [u8; 30] = "umount.pdxfs: missing target\n\0"
   pub let umnt_msg_missing_target_len : u64 = 29
 
-  pub let umnt_msg_not_implemented     : [u8; 35] = "umount.pdxfs: not yet implemented\n\0"
-  pub let umnt_msg_not_implemented_len : u64 = 34
+  // --- umount.pdxfs.M2-* scratch storage (issues #4/#5/#6). ----------------
+  pub let mut umnt_main_mount_id     : [u8; 8] = uninit @align(8)
+  pub let mut umnt_main_handle_count : [u8; 8] = uninit @align(8)
+  pub let mut umnt_main_stub_mask    : [u8; 8] = uninit @align(8)
 
   // ==========================================================================
   // _start -- user program entry point. Never returns (every terminal
@@ -90,7 +122,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "umount.pdxfs.M1-001 (scaffold) + M1-003 (#3): umount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&umnt_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to umnt_main_missing_target: sys_write(2, umnt_msg_missing_target, 29), sys_exit(2) -- exit code 2 reuses mkfs.pdxfs's own 'missing positional is a parse-error-class misuse' convention (design/tooling/volume-tooling-ux.md has no umount-specific sentence for this case). Phase 2 (on ARGV_OK): r14 = &umnt_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags, Argv::PA_OFF_FLAGS); r15 = [r14+8] (ParsedArgv.target_ptr, Argv::PA_OFF_TARGET_PTR). Gate: rax = rbx & 0x8 (Argv::PA_FLAG_DRY_RUN); cmp rax, 0; je umnt_main_not_implemented when --dry-run was not given. On --dry-run: rdi = r15 (target_ptr), rsi = rbx (flags); call unmount_record_emit_dry_run (src/unmount_record.pdx, #3) -- prints the PdxFsUnmountRecord@0.1 line to fd 1, unconditionally (no target-classification gate -- see module header for why this differs from mkfs.pdxfs's dry-run gating). Then sys_exit(0). umnt_main_not_implemented: sys_write(2, umnt_msg_not_implemented, 34), sys_exit(1) -- the real unmount path is umount.pdxfs.M2/M3, not yet implemented. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree and mkfs.pdxfs's own main.pdx. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed umnt_main_.",
+      justification: "umount.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001/002/003 (#4/#5/#6): umount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&umnt_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to the missing-target arm: sys_write(2, umnt_msg_missing_target, 29), sys_exit(2). Phase 2 (on ARGV_OK): r14 = &umnt_argv_out; rbx = [r14+0] (ParsedArgv.flags); r15 = [r14+8] (ParsedArgv.target_ptr). Gate: rax = rbx & 0x8 (Argv::PA_FLAG_DRY_RUN); cmp rax,0; je umnt_main_run when --dry-run was not given. On --dry-run: rdi=r15, rsi=rbx; call unmount_record_emit_dry_run; sys_exit(0). umnt_main_run (the M2 pipeline, argv/r13 now dead and REPURPOSED to hold mount_id): (1) rdi=r15 (target_ptr), rsi=&umnt_main_mount_id (rip-relative lea); call target_resolve (src/target_resolve.pdx, #4) -> rax = TargetResolve::TR_OK|TR_ERR_MOUNT_NOT_FOUND; cmp rax,0; jne umnt_main_not_found. (2) r13 = [umnt_main_mount_id] (resolved mount_id). (3) rdi=r13, rax=rbx&0x2 (Argv::PA_FLAG_FORCE) staged into rsi as force_bit, rdx=&umnt_main_handle_count; call handle_check_refuse (src/handle_check.pdx, #5) -> rax = HandleCheck::HC_PROCEED|HC_REFUSE; cmp rax,0; jne umnt_main_in_use. (4) rdi=r13, rax=rbx&0x3 (PA_FLAG_LAZY|PA_FLAG_FORCE, this file's own umount_flags stand-in per unmount_op's module header) staged into rsi, rdx=&umnt_main_stub_mask; call unmount_op (src/unmount_op.pdx, #6) -> rax = UnmountOp::UO_RC_OK(0)|UO_RC_KERNEL_ERROR(2); r14 = rax (r14/umnt_argv_out's own fields are already loaded into rbx/r15, so r14 is dead and safe to repurpose here, surviving the emit call below since unmount_record_emit_result push/pops its own callee-save use). (5) rdi=r15 (target_ptr), rsi=r13 (mount_id), rdx=r14 (result_code, doubling as UnmountRecord::UR_RC_OK/UR_RC_KERNEL_ERROR -- numerically identical per unmount_op.pdx's own duplicated-constant note), rcx=0 (handle_count -- the real happy path never refuses, so this is always 0 here), r8=[umnt_main_stub_mask]; call unmount_record_emit_result (src/unmount_record.pdx, #6). cmp r14,0; je umnt_main_exit_ok; else sys_exit(6) (KERNEL_ERROR). umnt_main_exit_ok: sys_exit(0). umnt_main_not_found: rdi=r15, rsi=0 (mount_id unresolved placeholder), rdx=3 (UR_RC_MOUNT_NOT_FOUND), rcx=0, r8=0 (no substep ran); call unmount_record_emit_result; sys_exit(3). umnt_main_in_use: rdi=r15, rsi=r13 (mount_id WAS resolved -- refusal happens after resolution), rdx=1 (UR_RC_IN_USE), rcx=[umnt_main_handle_count], r8=0 (unmount_op never called on this path); call unmount_record_emit_result; sys_exit(5). Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders, matching every other _start in the paideia-os monorepo. No `add reg,[mem]`; every zero-check is cmp reg,0 (no `test` mnemonic). Labels prefixed umnt_main_.",
       block: {
         mov r12, rdi;                       // r12 = argc
         mov r13, rsi;                       // r13 = argv
@@ -126,7 +158,7 @@ module Main = structure {
         mov rax, rbx;
         and rax, 0x8;
         cmp rax, 0;
-        je umnt_main_not_implemented;
+        je umnt_main_run;
 
         // ---- --dry-run: emit the dry-run unmount record. -------------------
         mov rdi, r15;                        // target_ptr
@@ -138,15 +170,88 @@ module Main = structure {
         syscall;
         hlt;
 
-      umnt_main_not_implemented:
-        mov rdi, 2;                          // fd = stderr
-        lea rsi, [rip + umnt_msg_not_implemented];
-        mov rdx, 34;                         // umnt_msg_not_implemented_len
-        mov rax, 1;                          // SC+ ID 1 = sys_write
-        syscall;
+        // =====================================================================
+        // umnt_main_run -- the M2 real pipeline (issues #4/#5/#6). argv (r13)
+        // is dead by this point (argv_parse already copied everything needed
+        // into umnt_argv_out); r13 is REPURPOSED below to hold the resolved
+        // mount_id.
+        // =====================================================================
+      umnt_main_run:
+        // ---- (1) Resolve target -> mount_id. --------------------------------
+        mov rdi, r15;                        // target_ptr
+        lea rsi, [rip + umnt_main_mount_id];
+        call target_resolve;
 
-        mov rdi, 1;                          // status = 1
-        mov rax, 60;                          // SC+ ID 60 = sys_exit
+        cmp rax, 0;                          // TargetResolve::TR_OK
+        jne umnt_main_not_found;
+
+        mov r13, [rip + umnt_main_mount_id]; // r13 = resolved mount_id
+
+        // ---- (2) Handle-count refusal check. ---------------------------------
+        mov rdi, r13;                        // mount_id
+        mov rax, rbx;
+        and rax, 0x2;                        // Argv::PA_FLAG_FORCE
+        mov rsi, rax;                        // force_bit
+        lea rdx, [rip + umnt_main_handle_count];
+        call handle_check_refuse;
+
+        cmp rax, 0;                          // HandleCheck::HC_PROCEED
+        jne umnt_main_in_use;
+
+        // ---- (3) Real unmount pipeline. ---------------------------------------
+        mov rdi, r13;                        // mount_id
+        mov rax, rbx;
+        and rax, 0x3;                        // PA_FLAG_LAZY | PA_FLAG_FORCE
+        mov rsi, rax;                        // umount_flags (see unmount_op.pdx)
+        lea rdx, [rip + umnt_main_stub_mask];
+        call unmount_op;
+
+        mov r14, rax;                        // r14 = UnmountOp::UO_RC_OK|UO_RC_KERNEL_ERROR
+
+        mov rdi, r15;                        // target_ptr
+        mov rsi, r13;                        // mount_id
+        mov rdx, r14;                        // result_code
+        xor rcx, rcx;                        // handle_count (real happy path never refuses)
+        mov r8, [rip + umnt_main_stub_mask];
+        call unmount_record_emit_result;
+
+        cmp r14, 0;                          // UnmountOp::UO_RC_OK
+        je umnt_main_exit_ok;
+
+        mov rdi, 6;                          // status = 6 (KERNEL_ERROR)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      umnt_main_exit_ok:
+        xor rdi, rdi;                        // status = 0 (OK)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      umnt_main_not_found:
+        mov rdi, r15;                        // target_ptr
+        xor rsi, rsi;                        // mount_id: unresolved placeholder
+        mov rdx, 3;                          // UnmountRecord::UR_RC_MOUNT_NOT_FOUND
+        xor rcx, rcx;                        // handle_count: no check ran
+        xor r8, r8;                          // stub_mask: no substep ran
+        call unmount_record_emit_result;
+
+        mov rdi, 3;                          // status = 3 (MOUNT_NOT_FOUND)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      umnt_main_in_use:
+        mov rdi, r15;                        // target_ptr
+        mov rsi, r13;                        // mount_id (resolution succeeded)
+        mov rdx, 1;                          // UnmountRecord::UR_RC_IN_USE
+        mov rcx, [rip + umnt_main_handle_count];
+        xor r8, r8;                          // stub_mask: unmount_op never called
+        call unmount_record_emit_result;
+
+        mov rdi, 5;                          // status = 5 (IN_USE)
+        mov rax, 60;
         syscall;
         hlt
       }

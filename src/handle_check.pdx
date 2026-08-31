@@ -1,0 +1,140 @@
+// src/handle_check.pdx — umount.pdxfs.M2-002 (issue #5)
+// KIND_VOLUME.VOL_OP_QUERY_HANDLE_COUNT wiring + IN_USE refusal.
+//
+// design/tooling/volume-tooling-ux.md §5.3: before calling sys_umount,
+// the tool queries the resolved volume's open-handle count. If nonzero
+// AND `--force` is not set, the tool refuses (emits `PdxFsUnmountRecord
+// @0.1` with `result_code: IN_USE`, exit 5) rather than tearing down a
+// volume something still has open.
+//
+// ----------------------------------------------------------------------
+// Why this file is a HARD stub, not a real cap-invoke — TWO gaps, not one
+// ----------------------------------------------------------------------
+//
+// The design doc's own §5.3 prose already flags one gap: "queries the
+// volume for open handle count (KIND_VOLUME.VOL_OP_QUERY_HANDLE_COUNT,
+// a new op added by R53.M2 to R52's KIND_VOLUME op set)". A direct grep
+// of the landed kernel confirms this op has NOT landed:
+// `src/kernel/core/cap/kind_volume.pdx` defines `VOL_OP_QUERY_DEVICE_
+// SLOT`(0) through `VOL_OP_DEBUG_PRINT`(9), with `VOL_OP_MAX = 9` —
+// there is no ordinal 10 (or any other) named `VOL_OP_QUERY_HANDLE_
+// COUNT`, and `cap_handler_volume`'s own dispatch (`cmp rbp,9; ja
+// vol_hn_unsup`) treats any op past 9 as unsupported. This mirrors
+// `umount.pdxfs`'s own M1 `caps.decl` note (repeated in `design/
+// architecture.md` §7), so it is not a new finding — this file is where
+// it was expected to bite.
+//
+// A SECOND, independent gap makes the query unreachable even if the op
+// existed: `cap_handler_volume` resolves EVERYTHING it needs (rights,
+// row_id) from the CAP DESCRIPTOR the caller already holds a slot
+// for — the caller must already hold a `KIND_VOLUME` cap slot number to
+// invoke ANY op on it. But the real, frozen `_mount_table[]` per-slot
+// layout this tool can read via `libpdx-volume.mount_table_snapshot`
+// (see `src/target_resolve.pdx`'s own module header for the full
+// decode) carries exactly five fields — `mountpoint_vnode_idx`,
+// `root_vnode_idx`, `backend_type`, `flags`, `_reserved` — and NONE of
+// them is a cap-slot reference. There is no landed way to go from a
+// resolved `mount_id` (a `_mount_table[]` slot index) to the `KIND_
+// VOLUME` cap slot that volume was mounted through. **Flagged for
+// main**, alongside the two related gaps `src/target_resolve.pdx` and
+// `src/unmount_op.pdx` document.
+//
+// Given both gaps, `handle_check_query` below performs NO cap-invoke at
+// all — issuing one against a cap slot this tool has no way to derive
+// would either invoke an arbitrary, wrong slot or (if slot 0 happened
+// to be passed) risk operating on an unrelated capability. It is a
+// pure, deterministic stub returning 0 (never in use), matching this
+// issue's own instruction: "STUB the query returning 0 (never in
+// use)... The refusal check still runs — just never fires."
+// `handle_check_refuse` below performs the REAL refusal *logic*
+// (count > 0 AND !force) against that stubbed count, so the gate is
+// live code, ready to refuse correctly the day either gap above closes.
+//
+// A future real body (once VOL_OP_QUERY_HANDLE_COUNT lands AND a
+// mount_id -> KIND_VOLUME cap-slot resolution path exists) would
+// replace `handle_check_query`'s body with: resolve the cap slot for
+// `mount_id`, then `cap_invoke(slot, 10)` (op 10 being the first free
+// ordinal past `VOL_OP_MAX`=9) via SC+ ID 4, and return its rax
+// verbatim (cap_handler_volume's query arms return the field value
+// directly per `kind_volume.pdx`'s own dispatch).
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
+// `cmp reg, 0`. Reserved-label discipline: every branch label in this
+// file is prefixed `umnt_hc_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.3 (paideia-os);
+// src/kernel/core/cap/kind_volume.pdx (VOL_OP_* catalog, VOL_OP_MAX=9,
+// cap_handler_volume's op-arg encoding); src/target_resolve.pdx (this
+// repo, the sibling per-slot-layout gap write-up).
+
+module HandleCheck = structure {
+
+  // --- handle_check_refuse status codes. ----------------------------------
+  pub let HC_PROCEED : u64 = 0
+  pub let HC_REFUSE  : u64 = 1
+
+  // ==========================================================================
+  // handle_check_query(mount_id) -> u64  (always 0 at M2 -- see module header)
+  //
+  // Pure leaf, no push/pop, touches only rax. mount_id (rdi) is accepted
+  // for ABI parity with the real future body (see module header) but is
+  // not read -- there is nothing this stub can look up with it.
+  // ==========================================================================
+  pub let handle_check_query : (u64) -> u64 !{mem} @{} =
+    fn (mount_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M2-002 (#5): handle_check_query entry point. Hard stub -- see module header for the two independent gaps (VOL_OP_QUERY_HANDLE_COUNT not landed kernel-side; no mount_id -> KIND_VOLUME cap-slot resolution path exists in the real _mount_table[] per-slot layout) that make a real cap-invoke here impossible without fabricating a slot number. Body: `xor rax, rax; ret` -- always reports zero open handles. mount_id (rdi) is accepted but unread, kept only so a future real body's signature does not change at its call site in handle_check_refuse. No `add reg,[mem]`, no `test`. Label prefix umnt_hc_ (no branch labels needed at this stub's size).",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // handle_check_refuse(mount_id, force_bit, out_handle_count_ptr) -> u64
+  //     (HC_PROCEED | HC_REFUSE)
+  //
+  //   rdi = mount_id             forwarded to handle_check_query verbatim
+  //   rsi = force_bit            0 = --force not set; nonzero = --force set
+  //                              (caller pre-masks ParsedArgv.flags &
+  //                              Argv::PA_FLAG_FORCE and passes the
+  //                              result directly -- this function does
+  //                              not know about ParsedArgv's layout)
+  //   rdx = out_handle_count_ptr u64 write target; ALWAYS written
+  //                              (unlike target_resolve's "untouched on
+  //                              failure" convention -- the caller needs
+  //                              the count on BOTH outcomes to populate
+  //                              PdxFsUnmountRecord@0.1's handle_count
+  //                              field even on the HC_PROCEED path)
+  //
+  // No push/pop needed: handle_check_query touches only rax (mount_id
+  // in rdi is caller-save and dies after the call), so rsi (force_bit)
+  // and rdx (out_handle_count_ptr) survive the nested call untouched.
+  // ==========================================================================
+  pub let handle_check_refuse : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (mount_id: u64) (force_bit: u64) (out_handle_count_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M2-002 (#5): handle_check_refuse entry point. `call handle_check_query` with rdi already == mount_id (no re-mov needed) -> rax = handle_count (always 0 at M2, per that function's own stub). `mov [rdx+0], rax` writes the count out unconditionally -- the caller needs it for the emitted record regardless of outcome. `cmp rax,0; je umnt_hc_proceed` -- zero handles always proceeds regardless of force_bit. Otherwise (a hypothetical nonzero count once the stub above goes real): `cmp rsi,0; jne umnt_hc_proceed` -- a nonzero force_bit overrides the refusal. Falling through both checks sets `mov rax,1` (HC_REFUSE) and returns; umnt_hc_proceed sets `xor rax,rax` (HC_PROCEED) and returns. Given handle_check_query's current stub always returns 0, HC_REFUSE is unreachable at M2 -- this is the 'refusal check still runs, just never fires' posture this issue's own instruction asks for. No `add reg,[mem]`, no `test`. Labels prefixed umnt_hc_.",
+      block: {
+        call handle_check_query;           // rdi = mount_id already in place
+        mov [rdx + 0], rax;                // *out_handle_count_ptr = handle_count
+
+        cmp rax, 0;
+        je umnt_hc_proceed;
+
+        cmp rsi, 0;
+        jne umnt_hc_proceed;               // --force set: proceed despite handles
+
+        mov rax, 1;                        // HC_REFUSE
+        ret;
+
+      umnt_hc_proceed:
+        xor rax, rax;                      // HC_PROCEED
+        ret;
+      }
+    }
+}

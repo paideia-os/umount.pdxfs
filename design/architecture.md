@@ -63,6 +63,20 @@ granularity):
   §6 below and the file's own module header for the M3-002 landing
   plan.
 
+Three more modules landed at M2 (§11 below has the full write-up):
+
+- **`src/target_resolve.pdx`** (`TargetResolve`) — `target_resolve`
+  (M2-001, #4): classifies `<mount-id | mount-point>` and resolves it
+  to a `mount_id`, real for the numeric case, a documented dead end for
+  the path case.
+- **`src/handle_check.pdx`** (`HandleCheck`) — `handle_check_query` +
+  `handle_check_refuse` (M2-002, #5): the `IN_USE` refusal gate, real
+  logic over a hard-stubbed (always-zero) handle count.
+- **`src/unmount_op.pdx`** (`UnmountOp`) — `unmount_op` (M2-003, #6):
+  the real `sys_umount` syscall attempt plus four stubbed substeps,
+  with a `stub_mask` accumulator threaded through to the emitted
+  record.
+
 Kept as four separate files rather than one `main.pdx` monolith for the
 same reason `mkfs.pdxfs` gives: each has a distinct, independently-
 testable contract that grows independently at later milestones — `argv.
@@ -219,17 +233,141 @@ bug:
   `mount_table_snapshot` call at `umount.pdxfs.M2-001` is this tool's
   first `libpdx-volume` link.
 
-## 10. What M2/M3 need before they can open
+## 10. What M3 needs before it can open
 
-- `umount.pdxfs.M2-001` (mount-point resolution) needs
-  `libpdx-volume.M2`'s real `mount_table_snapshot` body.
-- `umount.pdxfs.M2-002` (handle-count query) needs the `KIND_VOLUME`
-  op-catalog gap (§7) resolved with osarch, and the `VOL_OP_QUERY_
-  HANDLE_COUNT` op itself landed (per the design doc, an R53.M2
-  addition — not confirmed landed as of this M1 caps.decl).
 - `umount.pdxfs.M3-002` (`--force` + elevate) needs a `libpdx-elevate`
   implementation to exist, or a decision to ship a minimal inline
-  fallback per §3 above.
+  fallback per §3 above. It ALSO needs §11's `KIND_VOLUME` handle-count
+  gap resolved first — `--force` currently has nothing to override,
+  since `handle_check_refuse`'s refusal never fires (§11.2).
 - `umount.pdxfs.M3-003` (semantic-pipe emit) needs the schema-registry
   service (§7.4 of the design doc) or falls back to text-layer output
   per that section's own contingency note.
+- `umount.pdxfs.M3-004` (`SIG_KEY_LOCKED` refusal) needs §11.3's
+  superblock-re-sign stub to go real first (a real re-sign attempt is
+  the only thing that can discover a locked signing key).
+
+## 11. M2 landing (#4/#5/#6) — three independent kernel/library gaps, none blocking the happy path
+
+M2's own instruction was explicit that every substep without a landed
+primitive should stub gracefully while the overall pipeline still
+completes and emits `OK`. All three M2 issues hit exactly that
+shape — each found a REAL primitive that turned out to be either
+absent, unreachable, or missing a field this tool needs, confirmed by
+direct grep/read of the kernel and `libpdx-volume` (not inferred from
+the design doc's own prose, which in two of the three cases turned out
+to describe an EARLIER intended shape than what actually landed).
+
+### 11.1 `target_resolve.pdx` (M2-001, #4) — `mount_id` == `_mount_table[]` slot; path resolution is a documented dead end
+
+`sys_mount.pdx`'s landed body returns its `mount_slot` (a
+`_mount_table[MOUNT_MAX=8]` index) as the caller-visible `mount_id` —
+there is no separate persistent allocator. A decimal-digit-leading
+target is therefore parsed directly as that slot index; no lookup
+needed, fully real.
+
+A non-numeric target (a path) is a different story. `libpdx-volume`'s
+`mount_table_snapshot` (M2-003 in that repo, landed) decodes the REAL
+`_mount_table[]` per-slot layout, which is five fields —
+`mountpoint_vnode_idx`, `root_vnode_idx`, `backend_type`, `flags`,
+`_reserved` — **not** the `{mount_id, volume_uuid, mount_point_id, ...}`
+record `volume-tooling-ux.md` §2.2 originally sketched. There is no
+path-comparable field in the real layout at all; `mount_table_snapshot`
+'s own module header independently flags this exact discrepancy. A
+second, independent problem: that function's decode loop dereferences
+a KERNEL virtual address directly, with no KPTI walker — safe only when
+invoked kernel-side, unsafe from this tool's ring-3 context. Given
+both, `target_resolve`'s path branch calls `mount_table_snapshot` for
+real against a deliberately all-zero local row (its own kind-gate then
+refuses before ever reaching the unsafe dereference) and returns
+`TR_ERR_MOUNT_NOT_FOUND` unconditionally — a real, safe, wired call
+with a deterministic (and honest) result, not a fabricated match. Every
+path-shaped `<mount-point>` target refuses at M2; every `<mount-id>`
+target resolves fully. **Flagged for main** — closing this needs either
+an ambient `KIND_PDXFS_MOUNT_TABLE` cap-slot convention plus a real
+path-to-vnode-idx primitive, or the richer §2.2-style record actually
+landing kernel-side.
+
+### 11.2 `handle_check.pdx` (M2-002, #5) — two gaps stack, not one
+
+The design doc's own §5.3 already flagged `VOL_OP_QUERY_HANDLE_COUNT`
+as "a new op added by R53.M2" — confirmed still absent: `kind_volume.
+pdx`'s `VOL_OP_MAX` is 9 (0..9, `VOL_OP_QUERY_*` + `VOL_OP_DEBUG_PRINT`
+only). A second gap surfaced during this landing, not previously
+documented anywhere: the real `_mount_table[]` per-slot layout (§11.1)
+has no cap-slot field, so there is no way to derive which `KIND_VOLUME`
+cap a resolved `mount_id` corresponds to even once the op lands.
+`handle_check_query` is therefore a hard stub returning 0
+unconditionally — no cap-invoke is attempted, since invoking an
+undiscoverable slot would either target the wrong capability or (if a
+placeholder slot number were fabricated) risk operating on an unrelated
+one. `handle_check_refuse`'s actual refusal logic (`count > 0 AND
+!force`) is real, live code exercised on every M2 call — it simply
+never triggers, matching the issue's own "the refusal check still
+runs — just never fires" instruction to the letter.
+
+### 11.3 `unmount_op.pdx` (M2-003, #6) — the syscall body landed months ago; dispatch never called it
+
+This is the most consequential finding of the three. `src/kernel/core/
+syscall/sys_umount.pdx` (R53.M2-003, #1738) landed a COMPLETE real
+`sys_umount_body` + `sys_umount_shim`. But `dispatch.pdx`'s
+`dispatch_umount` label (sysno 76) is still the original R53.M2-001
+(#1736) forward-declaration stub — `mov rax, 0xFFFFFFFFFFFFFFDA; ret`
+— unconditionally, confirmed by direct read of the current file.
+`sys_umount` has been unreachable from ring 3 since #1738 landed,
+regardless of what any caller passes. `unmount_op` issues the real
+syscall anyway (`rdi=mount_id, rsi=flags, rax=76`, per `dispatch_umount`
+'s own #1736 comment describing the intended calling convention) and
+treats the resulting deterministic `-ENOSYS` as a documented stub
+condition (bit 0 of `stub_mask`) rather than a hard failure — any OTHER
+negative return (reachable only once dispatch is rewired) IS treated as
+`UO_RC_KERNEL_ERROR` and aborts the remaining substeps. **Flagged for
+main**: this needs a one-block `dispatch.pdx` rewrite (mirroring
+`dispatch_open`'s KPTI-bounce shape per that file's own #1736 comment),
+not a design decision.
+
+Steps 2 (cache flush + txn drain), 3 (CLEAN checkpoint), and 4
+(superblock re-sign) have no landed primitive at all — no `KIND_VOLUME`
+op name for the first two, and `libpdx-volume.pdxb_sign_superblock`
+(real, but needing a 4096-byte in-memory superblock buffer + a 32-byte
+signing seed this ring-3 tool has no way to obtain) for the third. Step
+5 (row remove) has no op in `KIND_PDXFS_MOUNT_TABLE`'s real catalog
+(`PMT_OP_MAX` = 3: LIST/READ_ROW/APPEND_ROW/QUERY_SLOT_COUNT). Each
+stubs with its own `stub_mask` bit, documented in `unmount_op.pdx`'s
+own module header. The overall pipeline still completes and reports
+`result_code: OK` with the full stub accounting in the emitted
+record's metadata — per this issue's own instruction.
+
+### 11.4 `unmount_record.pdx` additions
+
+`unmount_record_emit_result` (the real five-field emitter: `target`,
+`mount_id`, `result_code`, `handle_count`, `stub_mask`) and
+`unmount_record_write_u64_dec` (a decimal-conversion helper extracted
+from the M1 dry-run emitter's own inline div-by-10 logic, now shared
+three ways — `mount_id`/`handle_count`/`stub_mask` — rather than
+tripling that boilerplate). Four new numeric result codes: `UR_RC_OK`
+(0), `UR_RC_IN_USE` (1), `UR_RC_KERNEL_ERROR` (2),
+`UR_RC_MOUNT_NOT_FOUND` (3) — deliberately duplicated (not
+cross-module-referenced; this codebase has no precedent for that) in
+`unmount_op.pdx`'s `UO_RC_*` and `main.pdx`'s own literals, matching
+`mount_table_snapshot.pdx`'s own established convention for sharing a
+numeric vocabulary across files without a language-level shared
+constant.
+
+### 11.5 `main.pdx` wiring + exit codes
+
+`main.pdx`'s M2 pipeline (label `umnt_main_run`, reached whenever
+`--dry-run` is not set) chains `target_resolve` ->
+`handle_check_refuse` -> `unmount_op` -> `unmount_record_emit_result`,
+with three early-exit branches (`umnt_main_not_found`,
+`umnt_main_in_use`, plus the `unmount_op` kernel-error arm). This
+file's own exit-code table (no upstream doc pins these numbers): `0` =
+OK, `2` = `ARGV_ERR_MISSING_TARGET` (M1), `3` = `MOUNT_NOT_FOUND`, `5`
+= `IN_USE` (per issue #5's own "exit 5" instruction), `6` =
+`KERNEL_ERROR`. Register reuse note: `r13` (dead `argv` after
+`argv_parse` returns) is repurposed to hold the resolved `mount_id`;
+`r14` (dead `&umnt_argv_out` once `rbx`/`r15` are loaded) is repurposed
+to hold `unmount_op`'s result code across the `unmount_record_emit_
+result` call — both documented in `main.pdx`'s own module header and
+safe because none of the M2 helper functions touch `r13`/`r14`
+un-restored (see each file's own leaf/push-pop contract).

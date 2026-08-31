@@ -82,6 +82,35 @@ module UnmountRecord = structure {
   pub let ur_lit_suffix     : [u8; 26] = ", result_code: DRY_RUN }\n\0"
   pub let ur_lit_suffix_len : u64 = 25
 
+  // --- umount.pdxfs.M2-003 (#6) additions: unmount_record_emit_result's
+  //     own literal chunks + result_code codes/words. See that
+  //     function's own module-header note (below) for why this is a
+  //     SEPARATE emitter rather than a extension of
+  //     unmount_record_emit_dry_run -- the M1 dry-run line and the M2
+  //     real-outcome line are different schemas (three fields vs. five)
+  //     with no field overlap worth sharing beyond `target`. ------------
+
+  // --- unmount_record_emit_result's numeric result_code values. Mirrored
+  //     (duplicated, not cross-module-referenced -- see this repo's
+  //     established "no pub let cross-module numeric reference"
+  //     convention, e.g. libpdx-volume's mount_table_snapshot.pdx) in
+  //     src/unmount_op.pdx's UO_RC_* and main.pdx's own literal 1/3. ----
+  pub let UR_RC_OK               : u64 = 0
+  pub let UR_RC_IN_USE           : u64 = 1
+  pub let UR_RC_KERNEL_ERROR     : u64 = 2
+  pub let UR_RC_MOUNT_NOT_FOUND  : u64 = 3
+
+  pub let ur_lit_mount_id     : [u8; 13] = ", mount_id: \0"
+  pub let ur_lit_result_code  : [u8; 16] = ", result_code: \0"
+  pub let ur_lit_handle_count : [u8; 17] = ", handle_count: \0"
+  pub let ur_lit_stub_mask    : [u8; 14] = ", stub_mask: \0"
+  pub let ur_lit_result_suffix : [u8; 4] = " }\n\0"
+
+  pub let ur_lit_rc_ok               : [u8; 3]  = "OK\0"
+  pub let ur_lit_rc_in_use           : [u8; 7]  = "IN_USE\0"
+  pub let ur_lit_rc_kernel_error     : [u8; 13] = "KERNEL_ERROR\0"
+  pub let ur_lit_rc_mount_not_found  : [u8; 16] = "MOUNT_NOT_FOUND\0"
+
   // ==========================================================================
   // unmount_record_strlen(s) -> u64
   //
@@ -246,6 +275,264 @@ module UnmountRecord = structure {
         syscall;
 
         pop r13;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // unmount_record_write_u64_dec(fd, value) -> ()
+  //
+  // umount.pdxfs.M2-003 (#6): shared decimal-conversion-and-write helper,
+  // extracted from unmount_record_emit_dry_run's own segment-4 inline
+  // logic (identical div-by-10 algorithm; see that function's own
+  // justification for the full derivation) since unmount_record_emit_
+  // result (below) needs the same conversion three times (mount_id,
+  // handle_count, stub_mask) and inlining it three times would triple
+  // the boilerplate for no benefit -- this repo's own "one module per
+  // public-entry-point family" granularity note (design/architecture.md
+  // §2) extends naturally to "one shared helper once a pattern repeats
+  // 3+ times in the same file".
+  //
+  //   rdi = fd     destination file descriptor (always 1/stdout at every
+  //                current call site, but not hard-coded so a future
+  //                fd-2 diagnostic reuse needs no change here)
+  //   rsi = value  the u64 to render in decimal
+  //
+  // Leaf with local stack scratch only: rax/rcx/rdx/r9/r10/al are all
+  // SysV caller-save; r11 holds fd across the single `syscall` at the
+  // end (r11 is untouched by the div loop, so no push/pop is needed --
+  // this function makes exactly one syscall, so there is no
+  // repeated-reload hazard from the kernel's #743 caller-save-register
+  // zeroing on sysret).
+  // ==========================================================================
+  pub let unmount_record_write_u64_dec : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (fd: u64) (value: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "umount.pdxfs.M2-003 (#6): unmount_record_write_u64_dec entry point. r11 = fd (rdi), held across the whole function since the div loop below never touches r11 and only one `syscall` occurs at the very end -- no push/pop needed, no repeated-reload hazard. `sub rsp,24` scratch (matches unmount_record_emit_dry_run's own segment-4 sizing rationale: 20 digit-buffer bytes + 4 alignment slop). Zero-value special case (rsi==0): writes a single '0' byte. General case (umnt_ur_wd_setup/_loop): r9 = remaining value (rsi), r10 = cursor at rsp+19 walking DOWN (MSB-last-write, no reversal pass needed, identical to unmount_record_emit_dry_run's segment 4); each iteration divides r9 by the compile-time constant 10 via `div rcx` (rcx=10; this is a DIVISION by a constant, not a multiply, so it is unaffected by this repo's imul/mul-avoidance convention, which concerns constant MULTIPLICATION), converts the remainder to ASCII, stores at the cursor, and loops until the quotient hits 0. umnt_ur_wd_emit computes the digit count as `(rsp+20) - cursor` and issues the single sys_write(r11, cursor, count). `add rsp,24` restores the stack; ret. No `add reg,[mem]`. No `test` mnemonic. No `imul`/`mul`. Labels prefixed umnt_ur_wd_.",
+      block: {
+        mov r11, rdi;                       // r11 = fd
+        sub rsp, 24;
+
+        cmp rsi, 0;
+        jne umnt_ur_wd_setup;
+
+        mov al, 0x30;
+        mov [rsp], al;
+        mov rdi, r11;
+        mov rsi, rsp;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        jmp umnt_ur_wd_done;
+
+      umnt_ur_wd_setup:
+        mov r9, rsi;                        // r9 = remaining value
+        mov r10, rsp;
+        add r10, 19;                        // cursor at last staging byte
+
+      umnt_ur_wd_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                       // zero-extend rdx:rax for div
+        div rcx;                            // rax = quotient, rdx = remainder
+        add rdx, 0x30;                      // digit -> ASCII '0'..'9'
+        mov [r10], dl;
+        mov r9, rax;                        // r9 = quotient
+        cmp r9, 0;
+        je umnt_ur_wd_emit;
+        sub r10, 1;                         // advance cursor left (MSB-ward)
+        jmp umnt_ur_wd_loop;
+
+      umnt_ur_wd_emit:
+        mov rax, rsp;
+        add rax, 20;
+        sub rax, r10;                       // rax = digit count
+        mov rdx, rax;
+        mov rdi, r11;
+        mov rsi, r10;
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+      umnt_ur_wd_done:
+        add rsp, 24;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // unmount_record_emit_result(target_ptr, mount_id, result_code,
+  //                             handle_count, stub_mask) -> ()
+  //
+  // umount.pdxfs.M2-003 (#6): the real (non-dry-run) PdxFsUnmountRecord
+  // @0.1 emitter. Prints, to fd 1:
+  //
+  //   PdxFsUnmountRecord@0.1 { target: <target>, mount_id: <id>,
+  //     result_code: <OK|IN_USE|KERNEL_ERROR|MOUNT_NOT_FOUND>,
+  //     handle_count: <n>, stub_mask: <mask> }
+  //
+  // This is a DIFFERENT (and separately-maintained) five-field slice
+  // from the full 15-field §5.6 schema, and a different function from
+  // unmount_record_emit_dry_run's three-field DRY_RUN-only line -- see
+  // this repo's module header for why M1's slice omits everything this
+  // function adds. `stub_mask` is NOT a §5.6 schema field either; it is
+  // this M2 landing's own task-scoped rendering of src/unmount_op.pdx's
+  // UO_STUB_* accumulator (see that file's module header for the bit
+  // meanings: bit0=sys_umount syscall unwired/-ENOSYS, bit1=cache-flush
+  // stub, bit2=checkpoint stub, bit3=superblock-resign stub, bit4=row-
+  // remove stub), decimal-rendered since this repo has no hex printer.
+  // A MOUNT_NOT_FOUND-result call always passes stub_mask=0 (no
+  // substep ever ran) and a mount_id of 0 (unresolved -- caller never
+  // reads target_resolve's out-pointer on that path, per that
+  // function's own "untouched on failure" contract, so 0 is main.pdx's
+  // own explicit placeholder, not a real slot index).
+  //
+  //   rdi = target_ptr    NUL-terminated raw <mount-id | mount-point> string
+  //   rsi = mount_id      resolved mount_id (0 placeholder if unresolved)
+  //   rdx = result_code   UR_RC_OK | UR_RC_IN_USE | UR_RC_KERNEL_ERROR |
+  //                       UR_RC_MOUNT_NOT_FOUND (anything else also
+  //                       renders as MOUNT_NOT_FOUND -- the cmp chain's
+  //                       fall-through arm -- rather than a fifth,
+  //                       undefined word)
+  //   rcx = handle_count  from HandleCheck::handle_check_refuse's
+  //                       out-pointer (always 0 at M2 -- see
+  //                       src/handle_check.pdx)
+  //   r8  = stub_mask     from UnmountOp::unmount_op's out-pointer (0 on
+  //                       the MOUNT_NOT_FOUND / IN_USE paths, which
+  //                       never call unmount_op)
+  //
+  // Register plan (all SysV callee-save; pushed on entry, popped at the
+  // single shared epilogue before `ret` -- same discipline
+  // unmount_record_emit_dry_run and Argv::argv_parse follow):
+  //   rbx = target_ptr   (survives the nested unmount_record_strlen call)
+  //   r12 = mount_id     (survives to segment 4)
+  //   r13 = result_code  (survives to segment 6's cmp chain)
+  //   r14 = handle_count (survives to segment 8)
+  //   r15 = stub_mask    (survives to segment 10)
+  // Five registers needed (one per dynamic value) since, unlike
+  // unmount_record_emit_dry_run's two dynamic values, this function has
+  // five and every one of them is read AFTER at least one intervening
+  // `syscall` (which zeroes caller-save registers on return per the
+  // kernel's #743 hardening) or nested `call`.
+  // ==========================================================================
+  pub let unmount_record_emit_result : (u64, u64, u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (mount_id: u64) (result_code: u64) (handle_count: u64) (stub_mask: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "umount.pdxfs.M2-003 (#6): unmount_record_emit_result entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any, pops all five (reverse order) at the single shared epilogue before `ret`. rbx=target_ptr, r12=mount_id, r13=result_code, r14=handle_count, r15=stub_mask -- all now-saved callee-save regs surviving every nested `call`/`syscall` below. Eleven segments in wire order, each a literal-then-optionally-dynamic sys_write pair (or a single dynamic call for the four decimal segments): (1) ur_lit_prefix 'PdxFsUnmountRecord@0.1 { target: ' (33B). (2) target string via unmount_record_strlen(rbx) -> rdx=len, sys_write(1,rbx,rdx). (3) ur_lit_mount_id ', mount_id: ' (12B). (4) `call unmount_record_write_u64_dec` with rdi=1,rsi=r12 (mount_id). (5) ur_lit_result_code ', result_code: ' (15B). (6) result_code word selection: cmp r13 against 0/1/2 in turn (umnt_ur_res_ok/_in_use/_kernel_error), each setting rsi/rdx to its literal+len and jumping to umnt_ur_res_emit; any other value (including the canonical 3 = UR_RC_MOUNT_NOT_FOUND) falls through to the MOUNT_NOT_FOUND literal before umnt_ur_res_emit issues the one shared sys_write(1,rsi,rdx). (7) ur_lit_handle_count ', handle_count: ' (16B). (8) `call unmount_record_write_u64_dec` with rdi=1,rsi=r14 (handle_count). (9) ur_lit_stub_mask ', stub_mask: ' (13B). (10) `call unmount_record_write_u64_dec` with rdi=1,rsi=r15 (stub_mask). (11) ur_lit_result_suffix ' }\\n' (3B). Every literal-only segment reloads rdi=1/rax=1 fresh before its own `syscall` rather than assuming any caller-save register survives a prior syscall (matches unmount_record_emit_dry_run's own documented rationale: the kernel's #743 hardening zeroes rdi/rsi/rdx/r8/r9/r10 on every sysret). No `add reg,[mem]` anywhere. No `test` mnemonic. Labels prefixed umnt_ur_res_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = target_ptr
+        mov r12, rsi;                       // r12 = mount_id
+        mov r13, rdx;                       // r13 = result_code
+        mov r14, rcx;                       // r14 = handle_count
+        mov r15, r8;                        // r15 = stub_mask
+
+        // ---- Segment 1: "PdxFsUnmountRecord@0.1 { target: " -------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_prefix];
+        mov rdx, 33;                        // ur_lit_prefix_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 2: target string ---------------------------------------
+        mov rdi, rbx;
+        call unmount_record_strlen;
+        mov rdx, rax;
+        mov rdi, 1;
+        mov rsi, rbx;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 3: ", mount_id: " --------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_mount_id];
+        mov rdx, 12;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 4: mount_id, decimal ------------------------------------
+        mov rdi, 1;
+        mov rsi, r12;
+        call unmount_record_write_u64_dec;
+
+        // ---- Segment 5: ", result_code: " ------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_result_code];
+        mov rdx, 15;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 6: result_code word ---------------------------------------
+        cmp r13, 0;
+        je umnt_ur_res_ok;
+        cmp r13, 1;
+        je umnt_ur_res_in_use;
+        cmp r13, 2;
+        je umnt_ur_res_kernel_error;
+
+        lea rsi, [rip + ur_lit_rc_mount_not_found];
+        mov rdx, 15;
+        jmp umnt_ur_res_emit;
+
+      umnt_ur_res_ok:
+        lea rsi, [rip + ur_lit_rc_ok];
+        mov rdx, 2;
+        jmp umnt_ur_res_emit;
+
+      umnt_ur_res_in_use:
+        lea rsi, [rip + ur_lit_rc_in_use];
+        mov rdx, 6;
+        jmp umnt_ur_res_emit;
+
+      umnt_ur_res_kernel_error:
+        lea rsi, [rip + ur_lit_rc_kernel_error];
+        mov rdx, 12;
+
+      umnt_ur_res_emit:
+        mov rdi, 1;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 7: ", handle_count: " ------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_handle_count];
+        mov rdx, 16;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 8: handle_count, decimal ------------------------------------
+        mov rdi, 1;
+        mov rsi, r14;
+        call unmount_record_write_u64_dec;
+
+        // ---- Segment 9: ", stub_mask: " ------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_stub_mask];
+        mov rdx, 13;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 10: stub_mask, decimal ------------------------------------
+        mov rdi, 1;
+        mov rsi, r15;
+        call unmount_record_write_u64_dec;
+
+        // ---- Segment 11: " }\n" ------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + ur_lit_result_suffix];
+        mov rdx, 3;
+        mov rax, 1;
+        syscall;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
         pop rbx;
         ret;
       }

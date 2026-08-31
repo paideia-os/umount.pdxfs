@@ -87,3 +87,39 @@
 # milestones consume, per the same "typed-against, not yet touched"
 # posture mkfs.pdxfs's own M1 caps.decl documents for its stub
 # functions.
+#
+# M2 landing status (see STATUS.md; issues #4/#5/#6): STILL no cap-invoke
+# of any kind, and none of the three KIND gaps this file already flagged
+# above have closed. Specifics, confirmed by direct kernel/library grep
+# during M2:
+#
+#   - `KIND_PDXFS_MOUNT_TABLE`: no ambient cap-slot convention exists
+#     anywhere (design doc or this repo's own argv surface) for THIS
+#     tool to obtain a live singleton row, so `src/target_resolve.pdx`'s
+#     mount-point-path branch calls `libpdx-volume.mount_table_snapshot`
+#     against a deliberately all-zero local row (real call, real link
+#     edge, safe-by-construction failure -- see that file's own module
+#     header). `PMT_OP_MAX` = 3 (LIST/READ_ROW/APPEND_ROW/QUERY_SLOT_
+#     COUNT) also has no remove-row op, so `src/unmount_op.pdx`'s row-
+#     removal step (§5.5 step 5) is a documented stub (UO_STUB_ROW_
+#     REMOVE).
+#   - `KIND_VOLUME`: `VOL_OP_QUERY_HANDLE_COUNT` still has not landed
+#     (`kind_volume.pdx`'s `VOL_OP_MAX` is still 9, ops 0..9 only, no new
+#     ordinal). A SECOND, independently-blocking gap surfaced at M2: the
+#     real `_mount_table[]` per-slot layout carries no cap-slot field at
+#     all, so there is no way to derive WHICH `KIND_VOLUME` cap a
+#     resolved `mount_id` corresponds to even if the op existed.
+#     `src/handle_check.pdx`'s handle-count query is therefore a hard
+#     stub (always reports 0 handles); the IN_USE refusal LOGIC is real
+#     and live, just structurally unreachable until both gaps close.
+#   - `sys_umount` (sysno 76): the kernel BODY landed
+#     (`src/kernel/core/syscall/sys_umount.pdx`, R53.M2-003 #1738) but
+#     `dispatch.pdx`'s `dispatch_umount` label was never rewired off its
+#     original R53.M2-001 (#1736) `-ENOSYS` stub -- confirmed by direct
+#     read of dispatch.pdx as of this M2 landing. `src/unmount_op.pdx`
+#     issues the real syscall anyway and treats the deterministic
+#     `-ENOSYS` as a documented stub condition (bit 0 of its stub_mask),
+#     not a hard failure, per this milestone's own "the overall happy
+#     path should still complete and emit OK" instruction. **Flagged for
+#     main**: this is a one-block dispatch.pdx rewrite (mirror
+#     `dispatch_open`'s KPTI-bounce shape), not a design gap.

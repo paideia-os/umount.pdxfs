@@ -1,0 +1,215 @@
+// src/target_resolve.pdx — umount.pdxfs.M2-001 (issue #4)
+// Mount-point-or-mount-id target resolution.
+//
+// design/tooling/volume-tooling-ux.md §5.1 + §9.4: the `<mount-id |
+// mount-point>` positional is resolved to a `mount_id` two ways —
+// a decimal-digit-leading string is parsed directly as the numeric
+// mount_id (the u64 a prior `PdxFsMountRecord@0.1`'s `mount_id` field
+// carries); anything else is a VFS path resolved via
+// `libpdx-volume.mount_table_snapshot`.
+//
+// ----------------------------------------------------------------------
+// What "mount_id" actually IS — confirmed against the landed kernel
+// ----------------------------------------------------------------------
+//
+// `src/kernel/core/syscall/sys_mount.pdx` (R53.M2-002, #1737) returns
+// its `mount_slot` (an index into `_mount_table[MOUNT_MAX=8]`,
+// `core/fs/mount.pdx`) as the caller-visible return value — there is no
+// separate, persistent "mount_id" allocator anywhere kernel-side. So
+// "the u64 id from a prior PdxFsMountRecord@0.1's mount_id field" IS
+// the raw `_mount_table[]` slot index. A caller passing a decimal
+// digit string is therefore passing a slot index directly — this
+// branch needs no lookup at all, just a decimal parse.
+//
+// ----------------------------------------------------------------------
+// The mount-point-path branch — REAL call, DOCUMENTED dead end
+// ----------------------------------------------------------------------
+//
+// `libpdx-volume.mount_table_snapshot(row_ptr, out_ptr, out_cap,
+// out_count_ptr)` (landed, libpdx-volume.M2-003 #5) decodes the REAL,
+// frozen `_mount_table[]` per-slot layout — see that file's own module
+// header — which is FIVE fields: `mountpoint_vnode_idx`,
+// `root_vnode_idx`, `backend_type`, `flags`, `_reserved`. There is NO
+// path string, NO `mount_point_id`, and NO `mount_id` field anywhere in
+// that decode. `design/tooling/volume-tooling-ux.md` §2.2's own sketch
+// of a richer per-mount record ({mount_id, volume_uuid,
+// mount_point_id, ...}) has NOT landed kernel-side — confirmed by
+// `mount_table_snapshot.pdx`'s own module header, which flags exactly
+// this discrepancy for main. Consequence: **there is no field in the
+// real per-slot layout this file can compare a caller-supplied path
+// STRING against.** Matching would require either (a) a kernel
+// primitive that resolves a path to the same `mountpoint_vnode_idx`
+// space (no such ring-3-reachable primitive exists — `sys_stat`'s own
+// 64-byte record exposes an `ino`, not a vnode index, per
+// `src/kernel/core/syscall/sys_stat.pdx`), or (b) the richer §2.2
+// record actually landing. Neither exists at R53.M2. **Flagged for
+// main**, matching this repo's own precedent (`caps.decl` §KIND_VOLUME,
+// `design/architecture.md` §7).
+//
+// A SECOND, independent problem would block a real match even if (a)
+// or (b) landed: `mount_table_snapshot`'s decode loop dereferences
+// `table_row_addr` (the row's third qword) as a **kernel virtual
+// address** — it reads `_mount_table[]` directly, in place, with no
+// KPTI walker. That is safe when the row was obtained and the
+// function is invoked kernel-side (a witness, or a future in-kernel
+// consumer), but `umount.pdxfs` is a RING-3 program: per this
+// kernel's own KPTI model (every syscall body in
+// `src/kernel/core/syscall/` copies user<->kernel memory through a
+// walker specifically because ring-3 has no mapping for kernel VAs),
+// dereferencing a real `table_row_addr` from ring-3 would fault. This
+// file therefore never obtains or passes a REAL row — see below.
+//
+// Given both gaps, this file's path branch:
+//   1. Zeroes a local (userspace, .bss) 64-byte scratch buffer standing
+//      in for "the KIND_PDXFS_MOUNT_TABLE singleton row a real
+//      PMT_OP_READ_ROW cap-invoke would return" — no such cap-invoke is
+//      wired here (there is no documented ambient cap-slot convention
+//      for KIND_PDXFS_MOUNT_TABLE anywhere in the design doc or this
+//      repo's own argv surface, unlike `mount.pdxfs`'s explicit
+//      `<volume-cap>` positional for KIND_VOLUME).
+//   2. Calls `mount_table_snapshot` for real against that zeroed row.
+//      Gate 1 of that function (kind field == 0x1A5) fails
+//      deterministically against an all-zero row, so the call returns
+//      `LPV_MTS_ERR_BAD_MAGIC` WITHOUT EVER dereferencing
+//      `table_row_addr` — i.e. this call is safe from ring 3 precisely
+//      BECAUSE it can never reach the unsafe kernel-VA read. This is a
+//      real, wired call (proves the link edge), not a fabricated
+//      bypass.
+//   3. Returns `TR_ERR_MOUNT_NOT_FOUND` unconditionally for the path
+//      branch. Every `<mount-point>`-shaped target refuses at M2 until
+//      main resolves the ambient-cap-slot gap AND either a real
+//      path-to-vnode-idx primitive or the richer per-mount record
+//      lands. `<mount-id>`-shaped targets are fully real end-to-end.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
+// `cmp reg, 0`. No `imul`/`mul` for the decimal-parse accumulator —
+// `value*10` is decomposed as `(value<<3) + value + value`, per
+// mkfs.pdxfs's own `Argv::argv_parse_u64_dec` precedent (this file's
+// `umnt_tr_pu_parse` is the same algorithm, ported). Byte loads use the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom. Reserved-label
+// discipline: every branch label in this file is prefixed `umnt_tr_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.1, §9.4 (paideia-os);
+// libpdx-volume's src/mount_table_snapshot.pdx (M2-003, #5) and its own
+// module header (the §4.3 discrepancy write-up this file's header
+// leans on); src/kernel/core/syscall/sys_mount.pdx (mount_id ==
+// mount_slot); src/kernel/core/syscall/sys_stat.pdx (confirms no
+// ring-3 path->vnode_idx primitive exists).
+
+module TargetResolve = structure {
+
+  // --- target_resolve status codes. ---------------------------------------
+  pub let TR_OK                  : u64 = 0
+  pub let TR_ERR_MOUNT_NOT_FOUND : u64 = 1
+
+  // --- Scratch storage for the path branch (see module header §2). --------
+  // Row scratch is explicitly zeroed at every call (not just relying on
+  // .bss zero-init at process start) so a hypothetical future write
+  // into this buffer by other code cannot leave stale bytes that
+  // accidentally pass mount_table_snapshot's kind gate.
+  pub let mut umnt_tr_row_scratch     : [u8; 64]  = uninit @align(8)
+  pub let mut umnt_tr_entries_scratch : [u8; 320] = uninit @align(8)  // 8 * MTE_SUMMARY_BYTES(40)
+  pub let mut umnt_tr_count_scratch   : [u8; 8]   = uninit @align(8)
+
+  // ==========================================================================
+  // umnt_tr_pu_parse(str_ptr) -> u64
+  //
+  // Decimal-string-to-u64 parser, ported verbatim from mkfs.pdxfs's own
+  // `Argv::argv_parse_u64_dec` (same algorithm, renamed labels). Stops
+  // at the first non-digit byte (including NUL); a leading non-digit
+  // never reaches this function (target_resolve's caller-side gate
+  // already confirmed byte 0 is '0'..'9' before calling). Pure leaf:
+  // rax/rcx/rdi/r8 all SysV caller-save, no push/pop, no nested call.
+  // ==========================================================================
+  pub let umnt_tr_pu_parse : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M2-001 (#4): umnt_tr_pu_parse entry point. str_ptr in rdi, accumulator in rax (starts 0). Loop: xor+mov_b loads the next byte into rcx (zero-extended); cmp rcx,0x30; jl umnt_tr_pu_done (below '0', stops); cmp rcx,0x39; jg umnt_tr_pu_done (above '9', stops); else r8 = (rax<<3) + rax + rax (== rax*10, avoiding imul per this repo's no-multiply-by-constant convention), rcx -= 0x30 (digit value), r8 += rcx, rax = r8, rdi += 1, loop. Pure leaf -- no push/pop, no `add reg,[mem]` (accumulator math is register-only), no `test`. Labels prefixed umnt_tr_pu_. Ported verbatim from mkfs.pdxfs's Argv::argv_parse_u64_dec.",
+      block: {
+        xor rax, rax;
+
+      umnt_tr_pu_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0x30;
+        jl umnt_tr_pu_done;
+        cmp rcx, 0x39;
+        jg umnt_tr_pu_done;
+
+        mov r8, rax;
+        shl r8, 3;
+        add r8, rax;
+        add r8, rax;
+        sub rcx, 0x30;
+        add r8, rcx;
+        mov rax, r8;
+
+        add rdi, 1;
+        jmp umnt_tr_pu_loop;
+
+      umnt_tr_pu_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // target_resolve(target_ptr, out_mount_id_ptr) -> u64 (TR_OK | TR_ERR_MOUNT_NOT_FOUND)
+  //
+  //   rdi = target_ptr        NUL-terminated <mount-id | mount-point> string
+  //   rsi = out_mount_id_ptr  u64 write target; UNTOUCHED on
+  //                           TR_ERR_MOUNT_NOT_FOUND (matches
+  //                           mount.pdxfs's VolumeCap::volume_cap_resolve
+  //                           "out_ptr untouched on failure" convention)
+  //
+  // No push/pop needed: umnt_tr_pu_parse touches only rax/rcx/rdi/r8
+  // (never rsi/rdx), and mount_table_snapshot's own leaf contract never
+  // touches rbx/r12-r15 -- this function needs no callee-save register
+  // held across either nested call, so it stays a leaf itself.
+  // ==========================================================================
+  pub let target_resolve : (u64, u64) -> u64 !{mem} @{} =
+    fn (target_ptr: u64) (out_mount_id_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M2-001 (#4): target_resolve entry point. Classification gate: xor+mov_b loads target_ptr[0] into rax (zero-extended) without disturbing rdi (target_ptr stays live for the numeric branch's nested call). cmp rax,0x30; jl umnt_tr_path_branch (below '0' -> not a digit); cmp rax,0x39; jg umnt_tr_path_branch (above '9' -> not a digit). Numeric branch: `call umnt_tr_pu_parse` with rdi still == target_ptr (no re-mov needed); that callee touches only rax/rcx/rdi/r8 per its own leaf contract, so rsi (out_mount_id_ptr) survives untouched; `mov [rsi+0], rax` stores the parsed mount_id; `xor rax,rax` (TR_OK); ret. Path branch (umnt_tr_path_branch): zeroes umnt_tr_row_scratch via eight straight-line 8-byte stores (64 bytes total -- no loop needed at this fixed size, matching argv.pdx's own straight-line zero-init precedent), then calls mount_table_snapshot(row_ptr=&umnt_tr_row_scratch, out_ptr=&umnt_tr_entries_scratch, out_cap=8, out_count_ptr=&umnt_tr_count_scratch). Per this file's own module header, that row is deliberately all-zero (no live KIND_PDXFS_MOUNT_TABLE row is obtainable from this ring-3 tool at M2 -- no ambient cap-slot convention exists), so mount_table_snapshot's own Gate 1 (kind field must equal 0x1A5) fails deterministically as LPV_MTS_ERR_BAD_MAGIC WITHOUT that function ever dereferencing table_row_addr (a kernel VA unsafe to touch from ring 3 -- see module header). The return value is not branched on further -- even a hypothetical future LPV_MTS_OK could not be matched against a path string given the real per-slot layout has no path-comparable field (module header §2) -- so this branch falls straight through to `mov rax,1` (TR_ERR_MOUNT_NOT_FOUND) and returns with out_mount_id_ptr untouched. No `add reg,[mem]` anywhere. No `test` mnemonic. Labels prefixed umnt_tr_.",
+      block: {
+        xor rax, rax;
+        mov_b rax, [rdi];
+
+        cmp rax, 0x30;
+        jl umnt_tr_path_branch;
+        cmp rax, 0x39;
+        jg umnt_tr_path_branch;
+
+        // ---- Numeric branch: <mount-id> ------------------------------------
+        call umnt_tr_pu_parse;             // rdi still = target_ptr
+        mov [rsi + 0], rax;                // *out_mount_id_ptr = mount_id
+        xor rax, rax;                      // TR_OK
+        ret;
+
+      umnt_tr_path_branch:
+        // ---- Zero the row scratch (see module header §2). ------------------
+        xor rax, rax;
+        lea rcx, [rip + umnt_tr_row_scratch];
+        mov [rcx + 0], rax;
+        mov [rcx + 8], rax;
+        mov [rcx + 16], rax;
+        mov [rcx + 24], rax;
+        mov [rcx + 32], rax;
+        mov [rcx + 40], rax;
+        mov [rcx + 48], rax;
+        mov [rcx + 56], rax;
+
+        lea rdi, [rip + umnt_tr_row_scratch];
+        lea rsi, [rip + umnt_tr_entries_scratch];
+        mov rdx, 8;                        // out_cap = MOUNT_MAX
+        lea rcx, [rip + umnt_tr_count_scratch];
+        call mount_table_snapshot;         // rax = LPV_MTS_ERR_BAD_MAGIC, always, here
+
+        mov rax, 1;                        // TR_ERR_MOUNT_NOT_FOUND
+        ret;
+      }
+    }
+}
