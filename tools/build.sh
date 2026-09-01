@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Per-repo build script. Runs paideia-as build over every .pdx source.
+# Per-repo build script. Runs paideia-as build over every .pdx source, then
+# links the resulting objects into build-out/umount.pdxfs.elf via `ld`
+# (paideia-os#1976/#1977 satellite-tool embedding pipeline).
 #
 # Resolves paideia-as via (in order):
 #   1. $PAIDEIA_AS env var
@@ -9,8 +11,45 @@
 #
 # Requires paideia-as >= 0.21.0. The 0.9.0 shipped in $PATH by default does not
 # accept the syntax used in this repo.
+#
+# Usage:
+#   tools/build.sh [--extra-obj-dir DIR]...
+#
+# --extra-obj-dir DIR may be repeated. Every *.o file found directly inside
+# each DIR is added to the `ld` link line alongside this repo's own
+# src/*.pdx objects (e.g. a dependency's build-out directory). A DIR that
+# does not exist, or that contains no .o files, contributes nothing and is
+# NOT an error.
+#
+# Linking phase: once every src/*.pdx compiles cleanly, this repo's own
+# object files (build-out/*.o from src/*.pdx -- never the build-out/tests-
+# *.o unit-test scaffolding) plus any --extra-obj-dir objects are linked
+# via `ld -T link.ld` into build-out/umount.pdxfs.elf, then objcopy'd to
+# build-out/umount.pdxfs.bin.
 
 set -euo pipefail
+
+EXTRA_OBJECTS=()
+OWN_OBJECTS=()
+EXTRA_OBJ_DIRS=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --extra-obj-dir)
+            if [ "$#" -lt 2 ]; then
+                echo "[build] FAIL: --extra-obj-dir requires an argument" >&2
+                exit 2
+            fi
+            EXTRA_OBJ_DIRS+=("$2")
+            shift 2
+            ;;
+        *)
+            echo "[build] FAIL: unrecognized argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
 cd "$(dirname "$0")/.."
 
 MIN_VERSION="0.21.0"
@@ -61,6 +100,8 @@ for pdx in src/*.pdx; do
     obj="$BUILD_DIR/$(basename "$pdx" .pdx).o"
     if ! "$PA" build --emit elf64 "$pdx" -o "$obj" 2>&1; then
         FAIL=$((FAIL + 1))
+    else
+        OWN_OBJECTS+=("$obj")
     fi
 done
 
@@ -78,3 +119,26 @@ fi
 echo "[build] $COUNT source(s), $FAIL failure(s)"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "[build] OK"
+
+# ---- Gather extra objects from --extra-obj-dir directories. ----------------
+shopt -s nullglob
+for dir in "${EXTRA_OBJ_DIRS[@]}"; do
+    for obj in "$dir"/*.o; do
+        [ -f "$obj" ] || continue
+        EXTRA_OBJECTS+=("$obj")
+    done
+done
+shopt -u nullglob
+
+# ---- Link phase: OWN_OBJECTS + EXTRA_OBJECTS -> build-out/umount.pdxfs.elf.
+if [ "$FAIL" -eq 0 ] && [ "${#OWN_OBJECTS[@]}" -gt 0 ]; then
+    echo "[link] ld -T link.ld -> $BUILD_DIR/umount.pdxfs.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T link.ld \
+        -o "$BUILD_DIR/umount.pdxfs.elf" \
+        "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}"
+    echo "[link] OK -> $BUILD_DIR/umount.pdxfs.elf"
+
+    objcopy -O binary "$BUILD_DIR/umount.pdxfs.elf" "$BUILD_DIR/umount.pdxfs.bin"
+    echo "[link] OK -> $BUILD_DIR/umount.pdxfs.bin"
+fi

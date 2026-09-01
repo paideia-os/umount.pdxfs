@@ -1,5 +1,20 @@
 # umount.pdxfs — CHANGELOG
 
+## Unreleased — 2026-09-01
+
+**ELF-linking phase.** `tools/build.sh` now links `build-out/*.o`
+(this repo's own `src/*.pdx` objects) into `build-out/umount.pdxfs.elf`
+via `ld -T link.ld`, plus a matching `.bin` via `objcopy`, for
+paideia-os issue #1976/#1977 (satellite-tool boot-time `/bin` seeding
+pipeline). New `link.ld` at repo root — the same `true.ld`-derived
+layout (`.text`/`.rodata` at `0x00400000`, `.data`/`.bss` at
+`0x00600000`, `.bss` kept contiguous with `.data` per paideia-os#1595)
+every other satellite tool uses. `tools/build.sh` also gains a
+repeatable `--extra-obj-dir DIR` flag so a caller (e.g. paideia-os's
+own build, or a sibling satellite repo) can fold in dependency object
+files at link time; a missing or empty directory contributes nothing
+and is not an error. The `tests/*.pdx` objects are never linked.
+
 ## 1.0.0 — 2026-08-31 (R53 wave close, M5-001)
 
 **First release.** Manifest scaffolded for a future dual-signed
