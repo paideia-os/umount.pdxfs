@@ -71,6 +71,40 @@
 // cap_handler_volume's op-arg encoding); src/target_resolve.pdx (this
 // repo, the sibling per-slot-layout gap write-up).
 
+// ----------------------------------------------------------------------
+// umount.pdxfs.M3-001 (#7) addition: lazy_bit joins force_bit as a
+// second override input
+// ----------------------------------------------------------------------
+//
+// M2's `handle_check_refuse(mount_id, force_bit, out_handle_count_ptr)`
+// only let `--force` bypass a nonzero handle count. `--lazy` (§5.4)
+// needs the SAME bypass for a different downstream reason: a lazy
+// unmount does not refuse at all -- it proceeds and defers the actual
+// teardown (`unmount_op.pdx`'s new UO_RC_DEFERRED arm, umount.pdxfs.
+// M3-001) rather than tearing down immediately the way `--force` does.
+// This file's job is only "should main.pdx refuse before ever calling
+// unmount_op" -- which of {immediate-forced-teardown, deferred-wait}
+// applies is `unmount_op.pdx`'s own decision, made from the SAME
+// `(handle_count, umount_flags)` inputs it already receives. So
+// `handle_check_refuse` grows a `lazy_bit` parameter that bypasses the
+// refusal exactly like `force_bit` already does; the two flags are not
+// otherwise conflated.
+//
+// The refusal ARITHMETIC itself (`handle_count > 0 AND !force AND
+// !lazy` -> REFUSE) is split out into its own pure leaf,
+// `handle_check_decide`, so a test driver (`tests/test_in_use.pdx`,
+// umount.pdxfs.M4-002 #12) can exercise the real decision logic with an
+// explicit, caller-chosen `handle_count` -- `handle_check_query`'s own
+// hard stub (module header above) always returns 0, so there is no way
+// to reach the REFUSE arm through `handle_check_refuse`'s own top-level
+// call chain; `handle_check_decide` is the same real code, callable
+// directly. This mirrors this repo's own `unmount_op.pdx`'s new
+// M3-001/M3-002 arms, which likewise take `handle_count` as an explicit
+// caller-supplied argument rather than re-querying it, for the identical
+// testability reason.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.3, §5.4 (paideia-os).
+
 module HandleCheck = structure {
 
   // --- handle_check_refuse status codes. ----------------------------------
@@ -95,45 +129,74 @@ module HandleCheck = structure {
     }
 
   // ==========================================================================
-  // handle_check_refuse(mount_id, force_bit, out_handle_count_ptr) -> u64
+  // handle_check_decide(handle_count, force_bit, lazy_bit) -> u64
   //     (HC_PROCEED | HC_REFUSE)
   //
-  //   rdi = mount_id             forwarded to handle_check_query verbatim
-  //   rsi = force_bit            0 = --force not set; nonzero = --force set
-  //                              (caller pre-masks ParsedArgv.flags &
-  //                              Argv::PA_FLAG_FORCE and passes the
-  //                              result directly -- this function does
-  //                              not know about ParsedArgv's layout)
-  //   rdx = out_handle_count_ptr u64 write target; ALWAYS written
-  //                              (unlike target_resolve's "untouched on
-  //                              failure" convention -- the caller needs
-  //                              the count on BOTH outcomes to populate
-  //                              PdxFsUnmountRecord@0.1's handle_count
-  //                              field even on the HC_PROCEED path)
+  // umount.pdxfs.M3-001 (#7): the pure refusal-decision leaf, extracted
+  // from M2's handle_check_refuse body so it is directly callable with
+  // an explicit handle_count (see module header). Refuses iff
+  // handle_count > 0 AND force_bit == 0 AND lazy_bit == 0.
   //
-  // No push/pop needed: handle_check_query touches only rax (mount_id
-  // in rdi is caller-save and dies after the call), so rsi (force_bit)
-  // and rdx (out_handle_count_ptr) survive the nested call untouched.
+  //   rdi = handle_count
+  //   rsi = force_bit    0 or nonzero
+  //   rdx = lazy_bit     0 or nonzero
+  //
+  // Pure leaf: touches only rax, no push/pop, no nested call.
   // ==========================================================================
-  pub let handle_check_refuse : (u64, u64, u64) -> u64 !{mem} @{} =
-    fn (mount_id: u64) (force_bit: u64) (out_handle_count_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "umount.pdxfs.M2-002 (#5): handle_check_refuse entry point. `call handle_check_query` with rdi already == mount_id (no re-mov needed) -> rax = handle_count (always 0 at M2, per that function's own stub). `mov [rdx+0], rax` writes the count out unconditionally -- the caller needs it for the emitted record regardless of outcome. `cmp rax,0; je umnt_hc_proceed` -- zero handles always proceeds regardless of force_bit. Otherwise (a hypothetical nonzero count once the stub above goes real): `cmp rsi,0; jne umnt_hc_proceed` -- a nonzero force_bit overrides the refusal. Falling through both checks sets `mov rax,1` (HC_REFUSE) and returns; umnt_hc_proceed sets `xor rax,rax` (HC_PROCEED) and returns. Given handle_check_query's current stub always returns 0, HC_REFUSE is unreachable at M2 -- this is the 'refusal check still runs, just never fires' posture this issue's own instruction asks for. No `add reg,[mem]`, no `test`. Labels prefixed umnt_hc_.",
+  pub let handle_check_decide : (u64, u64, u64) -> u64 !{} @{} =
+    fn (handle_count: u64) (force_bit: u64) (lazy_bit: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "umount.pdxfs.M3-001 (#7): handle_check_decide entry point. `cmp rdi,0; je umnt_hc_dec_proceed` -- zero handles always proceeds. `cmp rsi,0; jne umnt_hc_dec_proceed` -- nonzero force_bit bypasses. `cmp rdx,0; jne umnt_hc_dec_proceed` -- nonzero lazy_bit ALSO bypasses (unmount_op.pdx's own DEFERRED arm is where the lazy case is actually handled; this gate only decides whether main.pdx refuses up front). Falling through all three sets HC_REFUSE (1); umnt_hc_dec_proceed sets HC_PROCEED (0). Pure leaf -- rax only, no push/pop. No `add reg,[mem]`, no `test`. Labels prefixed umnt_hc_dec_.",
       block: {
-        call handle_check_query;           // rdi = mount_id already in place
-        mov [rdx + 0], rax;                // *out_handle_count_ptr = handle_count
-
-        cmp rax, 0;
-        je umnt_hc_proceed;
+        cmp rdi, 0;
+        je umnt_hc_dec_proceed;
 
         cmp rsi, 0;
-        jne umnt_hc_proceed;               // --force set: proceed despite handles
+        jne umnt_hc_dec_proceed;
+
+        cmp rdx, 0;
+        jne umnt_hc_dec_proceed;
 
         mov rax, 1;                        // HC_REFUSE
         ret;
 
-      umnt_hc_proceed:
+      umnt_hc_dec_proceed:
         xor rax, rax;                      // HC_PROCEED
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // handle_check_refuse(mount_id, force_bit, lazy_bit, out_handle_count_ptr)
+  //     -> u64 (HC_PROCEED | HC_REFUSE)
+  //
+  //   rdi = mount_id             forwarded to handle_check_query verbatim
+  //   rsi = force_bit            0 = --force not set; nonzero = --force set
+  //   rdx = lazy_bit             0 = --lazy not set; nonzero = --lazy set
+  //                              (umount.pdxfs.M3-001, #7 -- see module
+  //                              header for why this joins force_bit)
+  //   rcx = out_handle_count_ptr u64 write target; ALWAYS written
+  //                              (the caller needs the count on BOTH
+  //                              outcomes to populate
+  //                              PdxFsUnmountRecord@0.1's handle_count
+  //                              field even on the HC_PROCEED path)
+  //
+  // No push/pop needed: handle_check_query touches only rax (mount_id
+  // in rdi is caller-save and dies after the call), so rsi/rdx/rcx
+  // (force_bit/lazy_bit/out_handle_count_ptr) survive the nested call
+  // untouched, and handle_check_decide is itself a pure rax-only leaf.
+  // ==========================================================================
+  pub let handle_check_refuse : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (mount_id: u64) (force_bit: u64) (lazy_bit: u64) (out_handle_count_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M2-002 (#5) + M3-001 (#7): handle_check_refuse entry point. `call handle_check_query` with rdi already == mount_id (no re-mov needed) -> rax = handle_count (always 0 at M2/M3, per that function's own stub); rsi/rdx/rcx survive untouched (handle_check_query touches only rax). `mov [rcx+0], rax` writes the count out unconditionally. Then `mov rdi, rax` (handle_count); rsi/rdx already hold force_bit/lazy_bit in the exact positions handle_check_decide's own signature needs -- `call handle_check_decide` and return its result verbatim (a plain tail delegation, no further branching needed here). Given handle_check_query's current stub always returns 0, HC_REFUSE is unreachable through THIS call chain at M2/M3 -- handle_check_decide itself (module header) is directly testable with a real nonzero handle_count. No `add reg,[mem]`, no `test`. Labels prefixed umnt_hc_ (none needed at this function's size).",
+      block: {
+        call handle_check_query;           // rdi = mount_id already in place
+        mov [rcx + 0], rax;                // *out_handle_count_ptr = handle_count
+
+        mov rdi, rax;                      // handle_count
+        // rsi = force_bit, rdx = lazy_bit already in place.
+        call handle_check_decide;
         ret;
       }
     }

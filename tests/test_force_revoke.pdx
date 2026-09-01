@@ -1,0 +1,98 @@
+// tests/test_force_revoke.pdx — umount.pdxfs.M4-004 (issue #14)
+// TestForceRevoke: `--force` correctness matrix.
+//
+// This issue's own task text asks to assert "ELEVATION_STUB (per
+// fail-closed) OR OK-with-revoked_handles-list". Only the FIRST arm is
+// reachable at this landing: `src/elevate.pdx`'s `elevate_request_
+// force_unmount` is a fail-closed stub that always returns `ELEV_DENY`
+// (no broker-endpoint cap exists for a real `libpdx-elevate` request --
+// see that file's own module header), so `UnmountOp::unmount_op`'s
+// `ELEV_GRANT` arm (the "OK-with-revoked_handles-list" branch) is real,
+// wired code but structurally unreachable through this call chain
+// today, matching this issue's own "(never in-tree)" framing for the
+// GRANT case elsewhere in this landing's brief.
+//
+// Four subtests:
+//   1. `HandleCheck::handle_check_decide(1, 1, 0)` -> `HC_PROCEED` (0)
+//      -- confirms `--force` bypasses the up-front refusal gate.
+//   2. `Elevate::elevate_request_force_unmount(mount_id)` -> `ELEV_DENY`
+//      (0) -- the fail-closed elevation check itself, called directly.
+//   3. `UnmountOp::unmount_op(mount_id=9, umount_flags=0x2, handle_
+//      count=1, out_stub_mask_ptr)` -> `UO_RC_ELEVATION_STUB` (5).
+//   4. The written stub_mask has `UO_STUB_ELEVATION_DENIED` (0x40) set.
+//
+// Return-code convention (matches tests/README.md): 0 = all four
+// subtests passed; 1..4 = the 1-based ordinal of the first failure.
+//
+// paideia-as encoder notes: no `add reg,[mem]`. No `test` mnemonic. No
+// callee-save register needs to survive across the three `call`s (each
+// subtest's result is checked and dispatched immediately), so `run()`
+// needs no push/pop. Label prefix `tfr_` (TestForceRevoke).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.2, §8.2 (paideia-os);
+// src/handle_check.pdx + src/elevate.pdx + src/unmount_op.pdx (this
+// repo, M3-001 #7 / M3-002 #8 -- the functions under test).
+
+module TestForceRevoke = structure {
+
+  pub let mut tfr_stub_mask : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M4-004 (#14): TestForceRevoke::run entry point. Subtest 1: rdi=1 (handle_count), rsi=1 (force_bit), rdx=0 (lazy_bit); call handle_check_decide -> cmp rax,0 (HC_PROCEED); jne tfr_case1_fail. Subtest 2: rdi=9 (mount_id, arbitrary nonzero); call elevate_request_force_unmount -> cmp rax,0 (Elevate::ELEV_DENY); jne tfr_case2_fail. Subtest 3+4: lea rcx,[rip+tfr_stub_mask]; rdi=9 (mount_id, same value as subtest 2 for trace readability), rsi=2 (umount_flags=PA_FLAG_FORCE), rdx=1 (handle_count); call unmount_op -> cmp rax,5 (UO_RC_ELEVATION_STUB); jne tfr_case3_fail. lea r11,[rip+tfr_stub_mask]; mov rax,[r11]; and rax,0x40; cmp rax,0; je tfr_case4_fail (UO_STUB_ELEVATION_DENIED). Falls through to xor rax,rax; ret (0, all four passed). No `add reg,[mem]`. No `test`. Label prefix tfr_.",
+      block: {
+        // ---- Subtest 1: the up-front bypass gate. ---------------------------
+        mov rdi, 1;                          // handle_count
+        mov rsi, 1;                          // force_bit
+        mov rdx, 0;                          // lazy_bit
+        call handle_check_decide;
+        cmp rax, 0;                          // HandleCheck::HC_PROCEED
+        jne tfr_case1_fail;
+
+        // ---- Subtest 2: the elevation check itself, called directly. --------
+        mov rdi, 9;                          // mount_id (arbitrary nonzero)
+        call elevate_request_force_unmount;
+        cmp rax, 0;                          // Elevate::ELEV_DENY
+        jne tfr_case2_fail;
+
+        // ---- Subtest 3+4: unmount_op's own ELEVATION_STUB gate + stub bit. --
+        lea rcx, [rip + tfr_stub_mask];
+        mov rdi, 9;                          // mount_id
+        mov rsi, 2;                          // umount_flags = PA_FLAG_FORCE
+        mov rdx, 1;                          // handle_count
+        call unmount_op;
+
+        cmp rax, 5;                          // UnmountOp::UO_RC_ELEVATION_STUB
+        jne tfr_case3_fail;
+
+        lea r11, [rip + tfr_stub_mask];
+        mov rax, [r11 + 0];
+        and rax, 0x40;                       // UnmountOp::UO_STUB_ELEVATION_DENIED
+        cmp rax, 0;
+        je tfr_case4_fail;
+
+        xor rax, rax;                        // 0: all four subtests passed
+        ret;
+
+      tfr_case1_fail:
+        mov rax, 1;
+        ret;
+
+      tfr_case2_fail:
+        mov rax, 2;
+        ret;
+
+      tfr_case3_fail:
+        mov rax, 3;
+        ret;
+
+      tfr_case4_fail:
+        mov rax, 4;
+        ret;
+      }
+    }
+}

@@ -1,4 +1,5 @@
-// src/main.pdx — umount.pdxfs.M1-001 (scaffold) + M1-003 (#3) — _start
+// src/main.pdx — umount.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2 (#4/
+// #5/#6) + M3 (#7/#8/#9/#10) — _start
 //
 // umount.pdxfs is a standalone ring-3 ELF, not a library: this file is
 // its `_start` entry point, argv-wired per the frozen execve ABI
@@ -8,52 +9,68 @@
 //   pointers -- no walker or syscall needed to dereference argv[i]),
 //   rdx = envp (unused by this tool), rsp % 16 == 0 at entry.
 //
-// M1 flow (umount.pdxfs.M1-003, issue #3):
+// M3 flow (umount.pdxfs.M3, issues #7-#10 -- supersedes the M2 flow
+// this header previously described; see git history / STATUS.md for
+// the M1/M2 shape):
 //
 //   1. Parse argv via Argv::argv_parse (src/argv.pdx, #2). On
 //      ARGV_ERR_MISSING_TARGET, print a usage diagnostic to fd 2 and
-//      exit 2 -- matches mkfs.pdxfs's own "missing positional is the
-//      same misuse class as a parse error" convention (design/tooling/
-//      volume-tooling-ux.md §3.2's "any other prefix is a parse error,
-//      exit 2" language for mkfs; umount's own §5 has no equivalent
-//      sentence, so this landing reuses the sibling tool's precedent
-//      rather than inventing a new exit-code convention).
-//   2. If --dry-run is set: call UnmountRecord::unmount_record_emit_
-//      dry_run (src/unmount_record.pdx, #3) to print the
-//      PdxFsUnmountRecord@0.1 line unconditionally, then exit 0.
-//
-// M2 flow (umount.pdxfs.M2-001/002/003, issues #4/#5/#6) -- reached
-// whenever --dry-run is NOT set:
-//
-//   3. TargetResolve::target_resolve (src/target_resolve.pdx, #4)
-//      resolves the raw <mount-id | mount-point> string to a mount_id.
-//      On TR_ERR_MOUNT_NOT_FOUND (every path-shaped target at M2 --
-//      see that file's own module header for why), emit a
-//      MOUNT_NOT_FOUND record and exit 3.
-//   4. HandleCheck::handle_check_refuse (src/handle_check.pdx, #5)
-//      checks the (currently hard-stubbed, always-zero) open-handle
-//      count against --force. On HC_REFUSE, emit an IN_USE record and
-//      exit 5. Unreachable at M2 (the stub never returns nonzero) but
-//      real, live gating logic -- see that file's module header.
-//   5. UnmountOp::unmount_op (src/unmount_op.pdx, #6) drives the real
-//      sys_umount syscall attempt plus four stubbed substeps (cache
-//      flush, checkpoint, superblock re-sign, row remove), returning
-//      UO_RC_OK or UO_RC_KERNEL_ERROR plus an accumulated stub_mask.
-//      Emit the resulting record (OK or KERNEL_ERROR) and exit 0 or 6.
+//      exit 2 -- UNCHANGED. No audit record is opened for this path
+//      (the target string itself is unknown, so there is nothing
+//      meaningful to audit yet -- matches mkfs.pdxfs's own posture).
+//   2. NEW at M3 (#9): call AuditWire::umnt_audit_begin(target_ptr,
+//      force_bit, lazy_bit) (src/audit_wire.pdx) and hold its return
+//      value (an audit_id, or 0 -- see that file's own "forgiving
+//      posture" note) in r12 for the rest of _start. This is the
+//      INTENT audit emission, opened BEFORE any dispatch so every
+//      outcome (dry-run, MOUNT_NOT_FOUND, IN_USE, OK, KERNEL_ERROR,
+//      DEFERRED, ELEVATION_STUB, SIG_KEY_LOCKED) gets the same audit
+//      wrapping.
+//   3. --dry-run set: call PipeWire::umnt_sp_emit_dry_run (src/
+//      pipe_wire.pdx, M3 #9 -- replaces the M1/M2 direct call to
+//      UnmountRecord::unmount_record_emit_dry_run) to print the
+//      deferred-header + preview line, commit the audit record
+//      (exit_status=0), then exit 0.
+//   4. --dry-run NOT set: TargetResolve::target_resolve (src/
+//      target_resolve.pdx, #4, unchanged). On TR_ERR_MOUNT_NOT_FOUND,
+//      emit a MOUNT_NOT_FOUND result via PipeWire::umnt_sp_emit_result,
+//      commit the audit record, exit 3.
+//   5. HandleCheck::handle_check_refuse (src/handle_check.pdx, #5,
+//      extended M3-001 #7 with a THIRD `lazy_bit` argument) checks the
+//      (hard-stubbed, always-zero) open-handle count against
+//      `--force`/`--lazy`. On HC_REFUSE (unreachable at this landing,
+//      per that file's own module header), emit an IN_USE record,
+//      commit, exit 5.
+//   6. UnmountOp::unmount_op (src/unmount_op.pdx, #6, extended M3-001
+//      #7 / M3-002 #8 / M3-004 #10 with a THIRD `handle_count` argument
+//      and three new result codes) drives the real sys_umount attempt,
+//      the --lazy DEFERRED stub, the --force elevate-stub gate, the
+//      real (unreachable) SIG_KEY_LOCKED sign-check, and four stubbed
+//      substeps. Its result code selects one of five terminal exits
+//      (0/6/0/7/8 -- see the exit-code table below); every arm emits
+//      the matching PdxFsUnmountRecord@0.1 via PipeWire::umnt_sp_
+//      emit_result and commits the audit record with that exit code.
+//      The DEFERRED arm additionally calls AuditWire::umnt_audit_
+//      record_deferred(audit_id) BEFORE the commit (#9's own "DEFERRED
+//      emission", a distinct mid-lifecycle audit event -- see that
+//      file's own module header).
 //
 // ----------------------------------------------------------------------
-// Exit-code table (this file's own convention; no upstream table pins
-// these numbers, so they are chosen here and documented for whoever
-// scripts against this tool next)
+// Exit-code table (this file's own convention; extended at M3)
 // ----------------------------------------------------------------------
 //
-//   0 = OK (dry-run print, or a real unmount that completed -- possibly
-//       with stubbed substeps; see PdxFsUnmountRecord@0.1's stub_mask)
+//   0 = OK (dry-run print, a real unmount that completed -- possibly
+//       with stubbed substeps -- or a --lazy DEFERRED schedule, which
+//       real `umount -l` semantics treat as a successful scheduling,
+//       not an error)
 //   2 = ARGV_ERR_MISSING_TARGET (no positional given)
 //   3 = MOUNT_NOT_FOUND (target_resolve could not resolve the target)
-//   5 = IN_USE (handle_check_refuse refused; matches this issue's own
-//       "IN_USE refusal (exit 5)" instruction verbatim)
+//   5 = IN_USE (handle_check_refuse refused; unreachable at this
+//       landing -- see handle_check.pdx)
 //   6 = KERNEL_ERROR (sys_umount returned a genuine non-ENOSYS error)
+//   7 = ELEVATION_STUB (--force fail-closed denial; NEW at M3-002 #8)
+//   8 = SIG_KEY_LOCKED (superblock re-sign refusal; NEW at M3-004 #10,
+//       unreachable at this landing -- see unmount_op.pdx)
 //
 // ----------------------------------------------------------------------
 // Register plan
@@ -61,20 +78,21 @@
 //
 // All callee-save (SysV rbx/r12-r15), so they survive every nested
 // `call` without extra push/pop -- each callee clobbers only
-// caller-save registers per its own justification (or, for
-// unmount_record_emit_result / unmount_op, pushes/pops its own
-// callee-save use internally), and SYSCALL preserves callee-save
-// registers by the amd64 fast-syscall convention:
+// caller-save registers per its own justification (or, for the
+// multi-register emit/op functions, pushes/pops its own callee-save
+// use internally), and SYSCALL preserves callee-save registers by the
+// amd64 fast-syscall convention:
 //
-//   r12 = argc (saved immediately from rdi, before any call)
-//   r13 = argv (saved immediately from rsi), REPURPOSED after argv_ok
-//         to hold the resolved mount_id across the M2 pipeline (argv
-//         is dead by then -- argv_parse already copied everything it
-//         needs out of it into umnt_argv_out)
+//   r12 = argc, THEN (from mkfs_main_argv_ok onward, M3) reused to
+//         hold the audit_id AuditWire::umnt_audit_begin returns -- argc
+//         is dead after Phase 1's `call argv_parse`, so this reuse is
+//         safe. r12 is never overwritten again after that single
+//         assignment.
+//   r13 = argv, THEN repurposed to hold the resolved mount_id across
+//         the M2/M3 pipeline (argv is dead by then).
 //   r14 = &umnt_argv_out (the ParsedArgv scratch struct, lea'd once),
 //         REPURPOSED after the dry-run gate to hold unmount_op's
-//         UO_RC_* result code across the emit call (umnt_argv_out's
-//         fields are already loaded into rbx/r15 by then)
+//         UO_RC_* result code across the emit + audit-commit calls.
 //   rbx = ParsedArgv.flags (loaded once after argv_parse succeeds)
 //   r15 = ParsedArgv.target_ptr (loaded once after argv_parse succeeds)
 //
@@ -93,8 +111,8 @@
 // Upstream: design/tooling/volume-tooling-ux.md §5 (paideia-os);
 // design/user/execve-abi.md (paideia-os, the frozen argv ABI this
 // _start consumes); src/target_resolve.pdx, src/handle_check.pdx,
-// src/unmount_op.pdx (this repo, the three M2 modules this file wires
-// together).
+// src/unmount_op.pdx, src/audit_wire.pdx, src/pipe_wire.pdx (this repo,
+// the modules this file wires together).
 
 module Main = structure {
 
@@ -109,7 +127,7 @@ module Main = structure {
   pub let umnt_msg_missing_target     : [u8; 30] = "umount.pdxfs: missing target\n\0"
   pub let umnt_msg_missing_target_len : u64 = 29
 
-  // --- umount.pdxfs.M2-* scratch storage (issues #4/#5/#6). ----------------
+  // --- umount.pdxfs.M2/M3 scratch storage (issues #4/#5/#6/#7/#8/#10). -----
   pub let mut umnt_main_mount_id     : [u8; 8] = uninit @align(8)
   pub let mut umnt_main_handle_count : [u8; 8] = uninit @align(8)
   pub let mut umnt_main_stub_mask    : [u8; 8] = uninit @align(8)
@@ -122,7 +140,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "umount.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001/002/003 (#4/#5/#6): umount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&umnt_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to the missing-target arm: sys_write(2, umnt_msg_missing_target, 29), sys_exit(2). Phase 2 (on ARGV_OK): r14 = &umnt_argv_out; rbx = [r14+0] (ParsedArgv.flags); r15 = [r14+8] (ParsedArgv.target_ptr). Gate: rax = rbx & 0x8 (Argv::PA_FLAG_DRY_RUN); cmp rax,0; je umnt_main_run when --dry-run was not given. On --dry-run: rdi=r15, rsi=rbx; call unmount_record_emit_dry_run; sys_exit(0). umnt_main_run (the M2 pipeline, argv/r13 now dead and REPURPOSED to hold mount_id): (1) rdi=r15 (target_ptr), rsi=&umnt_main_mount_id (rip-relative lea); call target_resolve (src/target_resolve.pdx, #4) -> rax = TargetResolve::TR_OK|TR_ERR_MOUNT_NOT_FOUND; cmp rax,0; jne umnt_main_not_found. (2) r13 = [umnt_main_mount_id] (resolved mount_id). (3) rdi=r13, rax=rbx&0x2 (Argv::PA_FLAG_FORCE) staged into rsi as force_bit, rdx=&umnt_main_handle_count; call handle_check_refuse (src/handle_check.pdx, #5) -> rax = HandleCheck::HC_PROCEED|HC_REFUSE; cmp rax,0; jne umnt_main_in_use. (4) rdi=r13, rax=rbx&0x3 (PA_FLAG_LAZY|PA_FLAG_FORCE, this file's own umount_flags stand-in per unmount_op's module header) staged into rsi, rdx=&umnt_main_stub_mask; call unmount_op (src/unmount_op.pdx, #6) -> rax = UnmountOp::UO_RC_OK(0)|UO_RC_KERNEL_ERROR(2); r14 = rax (r14/umnt_argv_out's own fields are already loaded into rbx/r15, so r14 is dead and safe to repurpose here, surviving the emit call below since unmount_record_emit_result push/pops its own callee-save use). (5) rdi=r15 (target_ptr), rsi=r13 (mount_id), rdx=r14 (result_code, doubling as UnmountRecord::UR_RC_OK/UR_RC_KERNEL_ERROR -- numerically identical per unmount_op.pdx's own duplicated-constant note), rcx=0 (handle_count -- the real happy path never refuses, so this is always 0 here), r8=[umnt_main_stub_mask]; call unmount_record_emit_result (src/unmount_record.pdx, #6). cmp r14,0; je umnt_main_exit_ok; else sys_exit(6) (KERNEL_ERROR). umnt_main_exit_ok: sys_exit(0). umnt_main_not_found: rdi=r15, rsi=0 (mount_id unresolved placeholder), rdx=3 (UR_RC_MOUNT_NOT_FOUND), rcx=0, r8=0 (no substep ran); call unmount_record_emit_result; sys_exit(3). umnt_main_in_use: rdi=r15, rsi=r13 (mount_id WAS resolved -- refusal happens after resolution), rdx=1 (UR_RC_IN_USE), rcx=[umnt_main_handle_count], r8=0 (unmount_op never called on this path); call unmount_record_emit_result; sys_exit(5). Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders, matching every other _start in the paideia-os monorepo. No `add reg,[mem]`; every zero-check is cmp reg,0 (no `test` mnemonic). Labels prefixed umnt_main_.",
+      justification: "umount.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001/002/003 (#4/#5/#6) + M3 (#7/#8/#9/#10): umount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&umnt_argv_out (rip-relative lea), call argv_parse. On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to the missing-target arm: sys_write(2, umnt_msg_missing_target, 29), sys_exit(2) -- no audit record opened, see module header. Phase 2 (on ARGV_OK): r14 = &umnt_argv_out; rbx = [r14+0] (ParsedArgv.flags); r15 = [r14+8] (ParsedArgv.target_ptr). NEW at M3 (#9): rdi=r15 (target_ptr), rax=rbx&0x2 (PA_FLAG_FORCE) staged into rsi (force_bit), rax=rbx&0x1 (PA_FLAG_LAZY) staged into rdx (lazy_bit); `call umnt_audit_begin` (src/audit_wire.pdx) -> rax=audit_id; `mov r12, rax` (r12 reused from the now-dead argc). Gate: rax = rbx & 0x8 (PA_FLAG_DRY_RUN); cmp rax,0; je umnt_main_run when --dry-run was not given. On --dry-run: rdi=r15, rsi=rbx; call umnt_sp_emit_dry_run (src/pipe_wire.pdx, M3 #9 -- replaces the M1/M2 direct call); rdi=r12, xor rsi,rsi (exit_status=0), call umnt_audit_commit (src/audit_wire.pdx); sys_exit(0). umnt_main_run (the M2/M3 pipeline, argv/r13 dead and REPURPOSED to hold mount_id): (1) rdi=r15 (target_ptr), rsi=&umnt_main_mount_id; call target_resolve -> rax = TR_OK|TR_ERR_MOUNT_NOT_FOUND; cmp rax,0; jne umnt_main_not_found. (2) r13 = [umnt_main_mount_id]. (3) rdi=r13, rax=rbx&0x2 (PA_FLAG_FORCE) staged into rsi (force_bit), rax=rbx&0x1 (PA_FLAG_LAZY) staged into rdx (lazy_bit), rcx=&umnt_main_handle_count; call handle_check_refuse (src/handle_check.pdx, M3-001 #7 extended signature) -> rax = HC_PROCEED|HC_REFUSE; cmp rax,0; jne umnt_main_in_use. (4) rdi=r13, rax=rbx&0x3 (PA_FLAG_LAZY|PA_FLAG_FORCE) staged into rsi (umount_flags), rdx=[umnt_main_handle_count] (handle_count, M3-001 #7's new third argument), rcx=&umnt_main_stub_mask; call unmount_op (src/unmount_op.pdx, M3-001/002/004 extended signature) -> rax in {UO_RC_OK=0, UO_RC_KERNEL_ERROR=2, UO_RC_DEFERRED=4, UO_RC_ELEVATION_STUB=5, UO_RC_SIG_KEY_LOCKED=6}; r14 = rax. cmp r14,4; je umnt_main_deferred. cmp r14,5; je umnt_main_elevation_stub. cmp r14,6; je umnt_main_sig_key_locked. (Falls through for 0 or 2.) rdi=r15, rsi=r13, rdx=r14, rcx=0 (handle_count for the record -- the real happy/kernel-error path never refuses), r8=[umnt_main_stub_mask]; call umnt_sp_emit_result (src/pipe_wire.pdx). cmp r14,0; je umnt_main_exit_ok. Otherwise (KERNEL_ERROR): r14 is OVERWRITTEN to 6 (the real process exit status -- UO_RC_KERNEL_ERROR's numeric value 2 is the RECORD's result_code, not the exit status main.pdx's own table promises), rdi=r12, rsi=r14(=6), call umnt_audit_commit; rdi=r14(=6); sys_exit(6). umnt_main_exit_ok: rdi=r12, xor rsi,rsi, call umnt_audit_commit; sys_exit(0). umnt_main_deferred: rdi=r12 (audit_id), call umnt_audit_record_deferred (the DEFERRED audit emission, #9) BEFORE the emit/commit below; rdi=r15, rsi=r13, mov rdx,4 (UR_RC_DEFERRED), rcx=[umnt_main_handle_count], r8=[umnt_main_stub_mask]; call umnt_sp_emit_result; rdi=r12, xor rsi,rsi (exit_status=0 -- lazy scheduling is a success per module header's exit-code table), call umnt_audit_commit; sys_exit(0). umnt_main_elevation_stub: rdi=r15, rsi=r13, mov rdx,5 (UR_RC_ELEVATION_STUB), xor rcx,rcx (handle_count already folded into the elevate decision, not re-surfaced here), r8=[umnt_main_stub_mask]; call umnt_sp_emit_result; rdi=r12, mov rsi,7, call umnt_audit_commit; sys_exit(7). umnt_main_sig_key_locked: rdi=r15, rsi=r13, mov rdx,6 (UR_RC_SIG_KEY_LOCKED), xor rcx,rcx, r8=[umnt_main_stub_mask]; call umnt_sp_emit_result; rdi=r12, mov rsi,8, call umnt_audit_commit; sys_exit(8). umnt_main_not_found: rdi=r15, xor rsi,rsi (mount_id unresolved placeholder), mov rdx,3 (UR_RC_MOUNT_NOT_FOUND), xor rcx,rcx, xor r8,r8; call umnt_sp_emit_result; rdi=r12, mov rsi,3, call umnt_audit_commit; sys_exit(3). umnt_main_in_use: rdi=r15, rsi=r13 (resolution succeeded), mov rdx,1 (UR_RC_IN_USE), rcx=[umnt_main_handle_count], xor r8,r8 (unmount_op never called); call umnt_sp_emit_result; rdi=r12, mov rsi,5, call umnt_audit_commit; sys_exit(5). Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders. No `add reg,[mem]`; every zero-check is cmp reg,0 (no `test` mnemonic). Labels prefixed umnt_main_.",
       block: {
         mov r12, rdi;                       // r12 = argc
         mov r13, rsi;                       // r13 = argv
@@ -154,16 +172,31 @@ module Main = structure {
         mov rbx, [r14 + 0];                  // rbx = flags (Argv::PA_OFF_FLAGS)
         mov r15, [r14 + 8];                  // r15 = target_ptr (Argv::PA_OFF_TARGET_PTR)
 
+        // ---- M3 (#9): open the INTENT audit record before any dispatch. ----
+        mov rdi, r15;                        // target_ptr
+        mov rax, rbx;
+        and rax, 0x2;                        // Argv::PA_FLAG_FORCE
+        mov rsi, rax;                        // force_bit
+        mov rax, rbx;
+        and rax, 0x1;                        // Argv::PA_FLAG_LAZY
+        mov rdx, rax;                        // lazy_bit
+        call umnt_audit_begin;               // src/audit_wire.pdx
+        mov r12, rax;                        // r12 = audit_id (argc is dead)
+
         // ---- Gate: --dry-run set? (Argv::PA_FLAG_DRY_RUN = 0x8) -----------
         mov rax, rbx;
         and rax, 0x8;
         cmp rax, 0;
         je umnt_main_run;
 
-        // ---- --dry-run: emit the dry-run unmount record. -------------------
+        // ---- --dry-run: INTENT preview line via pipe_wire. -----------------
         mov rdi, r15;                        // target_ptr
         mov rsi, rbx;                        // flags
-        call unmount_record_emit_dry_run;
+        call umnt_sp_emit_dry_run;           // src/pipe_wire.pdx (M3, #9)
+
+        mov rdi, r12;                        // audit_id
+        xor rsi, rsi;                        // exit_status = 0
+        call umnt_audit_commit;              // src/audit_wire.pdx
 
         xor rdi, rdi;                        // status = 0 (OK)
         mov rax, 60;                          // SC+ ID 60 = sys_exit
@@ -171,10 +204,8 @@ module Main = structure {
         hlt;
 
         // =====================================================================
-        // umnt_main_run -- the M2 real pipeline (issues #4/#5/#6). argv (r13)
-        // is dead by this point (argv_parse already copied everything needed
-        // into umnt_argv_out); r13 is REPURPOSED below to hold the resolved
-        // mount_id.
+        // umnt_main_run -- the M2/M3 real pipeline. argv (r13) is dead by this
+        // point; r13 is REPURPOSED below to hold the resolved mount_id.
         // =====================================================================
       umnt_main_run:
         // ---- (1) Resolve target -> mount_id. --------------------------------
@@ -187,44 +218,129 @@ module Main = structure {
 
         mov r13, [rip + umnt_main_mount_id]; // r13 = resolved mount_id
 
-        // ---- (2) Handle-count refusal check. ---------------------------------
+        // ---- (2) Handle-count refusal check (M3-001, #7: +lazy_bit). --------
         mov rdi, r13;                        // mount_id
         mov rax, rbx;
         and rax, 0x2;                        // Argv::PA_FLAG_FORCE
         mov rsi, rax;                        // force_bit
-        lea rdx, [rip + umnt_main_handle_count];
+        mov rax, rbx;
+        and rax, 0x1;                        // Argv::PA_FLAG_LAZY
+        mov rdx, rax;                        // lazy_bit
+        lea rcx, [rip + umnt_main_handle_count];
         call handle_check_refuse;
 
         cmp rax, 0;                          // HandleCheck::HC_PROCEED
         jne umnt_main_in_use;
 
-        // ---- (3) Real unmount pipeline. ---------------------------------------
+        // ---- (3) Real unmount pipeline (M3: +handle_count argument). --------
         mov rdi, r13;                        // mount_id
         mov rax, rbx;
         and rax, 0x3;                        // PA_FLAG_LAZY | PA_FLAG_FORCE
-        mov rsi, rax;                        // umount_flags (see unmount_op.pdx)
-        lea rdx, [rip + umnt_main_stub_mask];
+        mov rsi, rax;                        // umount_flags
+        mov rdx, [rip + umnt_main_handle_count]; // handle_count
+        lea rcx, [rip + umnt_main_stub_mask];
         call unmount_op;
 
-        mov r14, rax;                        // r14 = UnmountOp::UO_RC_OK|UO_RC_KERNEL_ERROR
+        mov r14, rax;                        // r14 = UnmountOp::UO_RC_*
 
+        cmp r14, 4;                          // UnmountOp::UO_RC_DEFERRED
+        je umnt_main_deferred;
+        cmp r14, 5;                          // UnmountOp::UO_RC_ELEVATION_STUB
+        je umnt_main_elevation_stub;
+        cmp r14, 6;                          // UnmountOp::UO_RC_SIG_KEY_LOCKED
+        je umnt_main_sig_key_locked;
+
+        // ---- OK (0) or KERNEL_ERROR (2). result_code (r14) IS the record's
+        //      UR_RC_OK/UR_RC_KERNEL_ERROR value (both numerically match
+        //      unmount_op's own codes), but the PROCESS exit status for
+        //      KERNEL_ERROR is 6, not 2 -- r14 is overwritten to the real
+        //      exit status right after the emit call so audit_commit and
+        //      sys_exit both see the same value main.pdx's own exit-code
+        //      table promises. --------------------------------------------
         mov rdi, r15;                        // target_ptr
         mov rsi, r13;                        // mount_id
-        mov rdx, r14;                        // result_code
+        mov rdx, r14;                        // result_code (0=OK, 2=KERNEL_ERROR)
         xor rcx, rcx;                        // handle_count (real happy path never refuses)
         mov r8, [rip + umnt_main_stub_mask];
-        call unmount_record_emit_result;
+        call umnt_sp_emit_result;            // src/pipe_wire.pdx
 
         cmp r14, 0;                          // UnmountOp::UO_RC_OK
         je umnt_main_exit_ok;
 
-        mov rdi, 6;                          // status = 6 (KERNEL_ERROR)
+        mov r14, 6;                          // exit status = 6 (KERNEL_ERROR)
+        mov rdi, r12;                        // audit_id
+        mov rsi, r14;                        // exit_status
+        call umnt_audit_commit;
+
+        mov rdi, r14;                        // status = 6
         mov rax, 60;
         syscall;
         hlt;
 
       umnt_main_exit_ok:
+        mov rdi, r12;                        // audit_id
+        xor rsi, rsi;                        // exit_status = 0
+        call umnt_audit_commit;
+
         xor rdi, rdi;                        // status = 0 (OK)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      umnt_main_deferred:
+        // ---- M3-001 (#7): --lazy DEFERRED. Also fires the DEFERRED audit
+        //      emission (#9) before the terminal commit. ----------------------
+        mov rdi, r12;                        // audit_id
+        call umnt_audit_record_deferred;     // src/audit_wire.pdx
+
+        mov rdi, r15;                        // target_ptr
+        mov rsi, r13;                        // mount_id
+        mov rdx, 4;                          // UnmountRecord::UR_RC_DEFERRED
+        mov rcx, [rip + umnt_main_handle_count];
+        mov r8, [rip + umnt_main_stub_mask];
+        call umnt_sp_emit_result;
+
+        mov rdi, r12;                        // audit_id
+        xor rsi, rsi;                        // exit_status = 0 (see module header)
+        call umnt_audit_commit;
+
+        xor rdi, rdi;                        // status = 0 (OK -- scheduled)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      umnt_main_elevation_stub:
+        // ---- M3-002 (#8): --force fail-closed elevation denial. -------------
+        mov rdi, r15;                        // target_ptr
+        mov rsi, r13;                        // mount_id
+        mov rdx, 5;                          // UnmountRecord::UR_RC_ELEVATION_STUB
+        xor rcx, rcx;                        // handle_count (already folded into the decision)
+        mov r8, [rip + umnt_main_stub_mask];
+        call umnt_sp_emit_result;
+
+        mov rdi, r12;                        // audit_id
+        mov rsi, 7;                          // exit_status = 7
+        call umnt_audit_commit;
+
+        mov rdi, 7;                          // status = 7 (ELEVATION_STUB)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      umnt_main_sig_key_locked:
+        // ---- M3-004 (#10): superblock re-sign refusal (unreachable). --------
+        mov rdi, r15;                        // target_ptr
+        mov rsi, r13;                        // mount_id
+        mov rdx, 6;                          // UnmountRecord::UR_RC_SIG_KEY_LOCKED
+        xor rcx, rcx;
+        mov r8, [rip + umnt_main_stub_mask];
+        call umnt_sp_emit_result;
+
+        mov rdi, r12;                        // audit_id
+        mov rsi, 8;                          // exit_status = 8
+        call umnt_audit_commit;
+
+        mov rdi, 8;                          // status = 8 (SIG_KEY_LOCKED)
         mov rax, 60;
         syscall;
         hlt;
@@ -235,7 +351,11 @@ module Main = structure {
         mov rdx, 3;                          // UnmountRecord::UR_RC_MOUNT_NOT_FOUND
         xor rcx, rcx;                        // handle_count: no check ran
         xor r8, r8;                          // stub_mask: no substep ran
-        call unmount_record_emit_result;
+        call umnt_sp_emit_result;
+
+        mov rdi, r12;                        // audit_id
+        mov rsi, 3;                          // exit_status = 3
+        call umnt_audit_commit;
 
         mov rdi, 3;                          // status = 3 (MOUNT_NOT_FOUND)
         mov rax, 60;
@@ -248,7 +368,11 @@ module Main = structure {
         mov rdx, 1;                          // UnmountRecord::UR_RC_IN_USE
         mov rcx, [rip + umnt_main_handle_count];
         xor r8, r8;                          // stub_mask: unmount_op never called
-        call unmount_record_emit_result;
+        call umnt_sp_emit_result;
+
+        mov rdi, r12;                        // audit_id
+        mov rsi, 5;                          // exit_status = 5
+        call umnt_audit_commit;
 
         mov rdi, 5;                          // status = 5 (IN_USE)
         mov rax, 60;

@@ -1,0 +1,100 @@
+// tests/test_lazy_deferred.pdx — umount.pdxfs.M4-003 (issue #13)
+// TestLazyDeferred: the fuller `--lazy` correctness matrix, a superset
+// of tests/test_lazy_stub.pdx's own M3-001 (#7) landing-time smoke
+// check -- see this repo's tests/README.md for why both drivers are
+// landed rather than merged (#7 and #13 each explicitly name a
+// filename in their own task text, and this driver additionally
+// exercises the up-front `handle_check_decide` bypass #7's own driver
+// does not).
+//
+// Three subtests:
+//   1. `HandleCheck::handle_check_decide(1, 0, 1)` -> `HC_PROCEED` (0)
+//      -- confirms `--lazy` bypasses the up-front refusal gate BEFORE
+//      `unmount_op` is ever reached (main.pdx's own Phase (2), see
+//      src/main.pdx's module header).
+//   2. `UnmountOp::unmount_op(mount_id=7, umount_flags=0x1, handle_
+//      count=1, out_stub_mask_ptr)` -> `UO_RC_DEFERRED` (4).
+//   3. The written stub_mask has `UO_STUB_LAZY_DEFERRED` (0x20) set.
+//
+// What this driver does NOT (and cannot) assert: that a follow-up
+// "now actually unmounted" completion record ever fires once the last
+// open handle closes. `src/unmount_op.pdx`'s own module header
+// documents why no such callback exists to fire one -- there is
+// nothing to await
+// or notify at, in-process or via any kernel primitive, at this
+// landing. A future consumer with a real multi-process QEMU harness
+// (open a handle, invoke `umount.pdxfs --lazy`, close the handle,
+// observe -- or fail to observe -- a second record) is the only way to
+// test that absence directly; this driver instead documents the
+// absence at the unit level, matching this repo's own "STUB with test
+// noting it" instruction for the SIG_KEY_LOCKED gate in
+// `src/unmount_op.pdx` (M3-004, #10).
+//
+// Return-code convention (matches tests/README.md): 0 = all three
+// subtests passed; 1..3 = the 1-based ordinal of the first failure.
+//
+// paideia-as encoder notes: no `add reg,[mem]`. No `test` mnemonic.
+// No callee-save register needs to survive across the two `call`s (the
+// handle_check_decide result is checked and dispatched before
+// unmount_op's own call begins, and unmount_op's own five register
+// arguments are all fresh `mov`s, not values carried from before the
+// first call), so `run()` needs no push/pop. Label prefix `tld_`
+// (TestLazyDeferred).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.4 (paideia-os);
+// src/handle_check.pdx + src/unmount_op.pdx (this repo, M3-001 #7 --
+// the functions under test).
+
+module TestLazyDeferred = structure {
+
+  pub let mut tld_stub_mask : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M4-003 (#13): TestLazyDeferred::run entry point. Subtest 1: rdi=1 (handle_count), rsi=0 (force_bit), rdx=1 (lazy_bit); call handle_check_decide -> cmp rax,0 (HC_PROCEED); jne tld_case1_fail. Subtest 2+3: lea rcx,[rip+tld_stub_mask]; rdi=7 (mount_id, arbitrary nonzero distinct from test_lazy_stub.pdx's own choice of 1, so a reader diffing the two drivers' traces can tell them apart), rsi=1 (umount_flags=PA_FLAG_LAZY), rdx=1 (handle_count); call unmount_op -> cmp rax,4 (UO_RC_DEFERRED); jne tld_case2_fail. lea r11,[rip+tld_stub_mask]; mov rax,[r11]; and rax,0x20; cmp rax,0; je tld_case3_fail (UO_STUB_LAZY_DEFERRED). Falls through to xor rax,rax; ret (0, all three passed). No `add reg,[mem]`. No `test`. Label prefix tld_.",
+      block: {
+        // ---- Subtest 1: the up-front bypass gate. ---------------------------
+        mov rdi, 1;                          // handle_count
+        mov rsi, 0;                          // force_bit
+        mov rdx, 1;                          // lazy_bit
+        call handle_check_decide;
+        cmp rax, 0;                          // HandleCheck::HC_PROCEED
+        jne tld_case1_fail;
+
+        // ---- Subtest 2+3: unmount_op's own DEFERRED gate + stub bit. --------
+        lea rcx, [rip + tld_stub_mask];
+        mov rdi, 7;                          // mount_id (arbitrary nonzero)
+        mov rsi, 1;                          // umount_flags = PA_FLAG_LAZY
+        mov rdx, 1;                          // handle_count
+        call unmount_op;
+
+        cmp rax, 4;                          // UnmountOp::UO_RC_DEFERRED
+        jne tld_case2_fail;
+
+        lea r11, [rip + tld_stub_mask];
+        mov rax, [r11 + 0];
+        and rax, 0x20;                       // UnmountOp::UO_STUB_LAZY_DEFERRED
+        cmp rax, 0;
+        je tld_case3_fail;
+
+        xor rax, rax;                        // 0: all three subtests passed
+        ret;
+
+      tld_case1_fail:
+        mov rax, 1;
+        ret;
+
+      tld_case2_fail:
+        mov rax, 2;
+        ret;
+
+      tld_case3_fail:
+        mov rax, 3;
+        ret;
+      }
+    }
+}

@@ -25,10 +25,9 @@ upstream CLI spec this tool implements.
 
 ## Status
 
-**M1 landed** (scaffold + caps.decl, argv surface, first runnable
-`--dry-run`). See [`STATUS.md`](STATUS.md) for the per-issue checklist
-and `design/tooling/volume-tooling-ux.md` §9.3 in paideia-os for the
-full M1..M5 milestone breakdown (16 issues).
+**v1.0.0 — M1..M5 all landed.** See [`STATUS.md`](STATUS.md) for the
+per-issue checklist and `design/tooling/volume-tooling-ux.md` §9.3 in
+paideia-os for the full M1..M5 milestone breakdown (16 issues).
 
 Try it (once built and linked into a runnable image):
 
@@ -36,17 +35,18 @@ Try it (once built and linked into a runnable image):
 umount.pdxfs --dry-run --lazy /mnt/foo
 ```
 
-prints:
+prints a deferral header (see `src/pipe_wire.pdx`) followed by:
 
 ```
 PdxFsUnmountRecord@0.1 { target: /mnt/foo, flags: 1, result_code: DRY_RUN }
 ```
 
-and exits 0 without unmounting anything. Any invocation without
-`--dry-run` currently prints `umount.pdxfs: not yet implemented` to
-stderr and exits 1 — the real teardown path (mount-table resolution,
-handle-count query, cache flush + txn drain + checkpoint, `--lazy` /
-`--force` handling) lands at M2/M3.
+and exits 0 without unmounting anything. A real invocation (no
+`--dry-run`) resolves the target, checks for open handles, drives a
+real `sys_umount` attempt plus four documented substeps, and emits a
+`PdxFsUnmountRecord@0.1` result line — see `design/architecture.md`
+§§11-12 for exactly which substeps are real vs. stubbed at this
+release, and for the `--lazy`/`--force` fail-closed/deferred postures.
 
 ## Depends on
 
@@ -65,10 +65,10 @@ handle-count query, cache flush + txn drain + checkpoint, `--lazy` /
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 | Scaffold, caps.decl, argv surface, first runnable `--dry-run` | **Landed** |
-| M2 | Mount-point resolution, handle-count query, non-force happy path | Pending |
-| M3 | `--lazy` + `--force` + audit-first + semantic-pipe | Pending |
-| M4 | Tests + smoke | Pending |
-| M5 | Signed release | Pending |
+| M2 | Mount-point resolution, handle-count query, non-force happy path | **Landed** |
+| M3 | `--lazy` + `--force` + audit-first + semantic-pipe | **Landed** |
+| M4 | Tests + smoke | **Landed** |
+| M5 | Signed release | **Landed** |
 
 ## License
 

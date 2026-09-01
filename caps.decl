@@ -123,3 +123,60 @@
 #     path should still complete and emit OK" instruction. **Flagged for
 #     main**: this is a one-block dispatch.pdx rewrite (mirror
 #     `dispatch_open`'s KPTI-bounce shape), not a design gap.
+#
+# M3 landing status (see STATUS.md; issues #7/#8/#9/#10): three new
+# satellite-library links, no new syscalls of this repo's own, none of
+# the three M2 kernel/library gaps above have closed.
+#
+# consumed_satellite_libs (all cross-repo bare-label `call`s, the same
+# mechanism `src/target_resolve.pdx`'s M2 `mount_table_snapshot` call
+# already used):
+#
+#   libpdx-volume (M3-004, #10) -- `pdxb_sign_superblock`
+#     (`src/unmount_op.pdx`'s step 4). REAL call, against a deliberately
+#     PLACEHOLDER 4096-byte `.bss` scratch buffer (not the genuine
+#     on-disk superblock -- this tool still has no block-device read
+#     primitive) and a real, non-null, all-zero 32-byte seed buffer
+#     (not a real seed -- same "seed is zero, not unavailable" posture
+#     mkfs.pdxfs's own M3-004 landing documents for the identical
+#     intrinsic). The SIG_KEY_LOCKED refusal gate this call feeds is
+#     real and live but unreachable: the `MlDsa65::sign` intrinsic only
+#     fails on a NULL `seed_ptr`, and this buffer is never null.
+#
+#   libpdx-audit (@0.2, commit bfc63a5, landed dependency) --
+#     `AuditClient::audit_begin`, `AuditClient::audit_record_output`,
+#     `AuditClient::audit_commit` (`src/audit_wire.pdx`, #9). REAL calls
+#     (real IPC send attempts), but the daemon-side dispatch is the same
+#     confirmed-STUBBED `audit_journal_broker_dispatch` mkfs.pdxfs's own
+#     M3-004 landing documents -- every call here may therefore no-op at
+#     the daemon, per the same forgiving-posture instruction that
+#     landing established. `audit_record_output` is called exactly once
+#     per invocation, only on the `--lazy` DEFERRED arm (the "DEFERRED"
+#     mid-lifecycle audit emission #9 asks for).
+#
+#   libpdx-elevate (4844 LOC, mature -- landed dependency) -- NOT
+#     actually called for a real elevation decision
+#     (`src/elevate.pdx`, #8): this library's real API
+#     (`elevate_client_acquire`/`elevate_client_require`) needs a
+#     `parent_ep_slot` broker-endpoint cap this repo does not hold
+#     (`KIND_ELEVATE_CHANNEL = 0x191`, still the M1 placeholder,
+#     unchanged by this landing). `elevate_request_force_unmount` is
+#     therefore a fail-closed stub returning DENY unconditionally --
+#     the identical gap and posture mkfs.pdxfs's own M3-005
+#     `elevate_wire.pdx` documents over the same library.
+#
+#   libpdx-semantic-pipe (v1.0.0, real + released) -- NOT linked
+#     (`src/pipe_wire.pdx`, #9): confirmed via GitHub issue
+#     paideia-os#2000 that `Registry::bind_by_name` is inert (the
+#     backing `svc.schema-registry` service does not exist yet). Per
+#     mkfs.pdxfs's own M3-003 fallback precedent, every
+#     `PdxFsUnmountRecord@0.1` this repo emits remains the M1/M2
+#     line-based `sys_write(1, ...)` rendering, now preceded by one
+#     documented deferral header line.
+#
+# New (real, live) refusal/stub result codes added at M3 (see
+# `src/unmount_op.pdx` / `src/unmount_record.pdx` for the full bit/code
+# tables): `UO_RC_DEFERRED`/`UR_RC_DEFERRED` (4, --lazy, stubbed
+# completion), `UO_RC_ELEVATION_STUB`/`UR_RC_ELEVATION_STUB` (5,
+# --force, fail-closed), `UO_RC_SIG_KEY_LOCKED`/`UR_RC_SIG_KEY_LOCKED`
+# (6, superblock re-sign refusal, real gate, unreachable).

@@ -1,0 +1,101 @@
+// tests/test_in_use.pdx — umount.pdxfs.M4-002 (issue #12)
+// TestInUse: IN_USE refusal correctness matrix for
+// HandleCheck::handle_check_decide (src/handle_check.pdx).
+//
+// This issue's own task text asks to "mock handle_count > 0 (via a
+// hook or by asserting the VOL_OP_QUERY_HANDLE_COUNT result)". Neither
+// literal option exists in this codebase: there is no test-hook
+// mechanism anywhere in this repo, and `HandleCheck::handle_check_
+// query`'s own hard stub (src/handle_check.pdx's module header) always
+// returns 0 regardless of any kernel-side `VOL_OP_QUERY_HANDLE_COUNT`
+// result (the op itself has not landed kernel-side either -- see that
+// file's own gap write-up). This driver instead calls `HandleCheck::
+// handle_check_decide` directly -- the REAL refusal-arithmetic leaf
+// M3-001 (#7) extracted specifically so a caller can supply an explicit
+// `handle_count`, bypassing the query stub entirely without mocking
+// anything. This is the actual decision logic `handle_check_refuse`
+// delegates to, not a re-implementation.
+//
+// Four cases (handle_count, force_bit, lazy_bit) -> expected:
+//   1. (1, 0, 0) -> HC_REFUSE (1)  -- the IN_USE case itself
+//   2. (0, 0, 0) -> HC_PROCEED (0) -- no handles, nothing to refuse
+//   3. (1, 1, 0) -> HC_PROCEED (0) -- --force bypasses
+//   4. (1, 0, 1) -> HC_PROCEED (0) -- --lazy bypasses (M3-001, #7)
+//
+// Return-code convention (matches tests/README.md): 0 = all four cases
+// passed; 1..4 = the 1-based ordinal of the first case that failed.
+//
+// paideia-as encoder notes: no `add reg,[mem]`. No `test` mnemonic --
+// every check is `cmp`. No callee-save register is touched (each case
+// is a flat `mov rdi,.. ; mov rsi,.. ; mov rdx,.. ; call
+// handle_check_decide; cmp rax,expected; jne caseK_fail` block with no
+// state needing to survive across a call), so `run()` needs no
+// push/pop. Label prefix `tiu_` (TestInUse).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.3, §5.4 (paideia-os);
+// src/handle_check.pdx (this repo, M2-002 #5 + M3-001 #7 -- the
+// function under test).
+
+module TestInUse = structure {
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "umount.pdxfs.M4-002 (#12): TestInUse::run entry point. Four flat, independent cases against HandleCheck::handle_check_decide(handle_count, force_bit, lazy_bit) -- rdi/rsi/rdx set per case, `call handle_check_decide`, `cmp rax,<expected>; jne caseK_fail`. Case 1: (1,0,0) expect HC_REFUSE=1. Case 2: (0,0,0) expect HC_PROCEED=0. Case 3: (1,1,0) expect HC_PROCEED=0 (force bypass). Case 4: (1,0,1) expect HC_PROCEED=0 (lazy bypass, M3-001 #7). No register needs to survive across any of the four calls (each case's outcome is checked and dispatched immediately), so no push/pop anywhere in this function. Returns 0 if all four passed, else the 1-based ordinal of the first failure. No `add reg,[mem]`. No `test`. Label prefix tiu_.",
+      block: {
+        // ---- Case 1: (handle_count=1, force=0, lazy=0) -> REFUSE. -----------
+        mov rdi, 1;
+        mov rsi, 0;
+        mov rdx, 0;
+        call handle_check_decide;
+        cmp rax, 1;                          // HandleCheck::HC_REFUSE
+        jne tiu_case1_fail;
+
+        // ---- Case 2: (0, 0, 0) -> PROCEED. -----------------------------------
+        mov rdi, 0;
+        mov rsi, 0;
+        mov rdx, 0;
+        call handle_check_decide;
+        cmp rax, 0;                          // HandleCheck::HC_PROCEED
+        jne tiu_case2_fail;
+
+        // ---- Case 3: (1, 1, 0) -> PROCEED (force bypass). --------------------
+        mov rdi, 1;
+        mov rsi, 1;
+        mov rdx, 0;
+        call handle_check_decide;
+        cmp rax, 0;
+        jne tiu_case3_fail;
+
+        // ---- Case 4: (1, 0, 1) -> PROCEED (lazy bypass). ---------------------
+        mov rdi, 1;
+        mov rsi, 0;
+        mov rdx, 1;
+        call handle_check_decide;
+        cmp rax, 0;
+        jne tiu_case4_fail;
+
+        xor rax, rax;                        // 0: all four cases passed
+        ret;
+
+      tiu_case1_fail:
+        mov rax, 1;
+        ret;
+
+      tiu_case2_fail:
+        mov rax, 2;
+        ret;
+
+      tiu_case3_fail:
+        mov rax, 3;
+        ret;
+
+      tiu_case4_fail:
+        mov rax, 4;
+        ret;
+      }
+    }
+}

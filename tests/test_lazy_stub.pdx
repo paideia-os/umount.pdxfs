@@ -1,0 +1,71 @@
+// tests/test_lazy_stub.pdx — umount.pdxfs.M3-001 (issue #7)
+// TestLazyStub: landing-time smoke check for UnmountOp::unmount_op's
+// new `--lazy` DEFERRED gate (src/unmount_op.pdx).
+//
+// Calls `unmount_op(mount_id=1, umount_flags=PA_FLAG_LAZY=0x1,
+// handle_count=1, out_stub_mask_ptr=&scratch)` directly, with an
+// EXPLICIT nonzero `handle_count` -- this bypasses `HandleCheck::
+// handle_check_query`'s hard stub (always 0, see src/handle_check.pdx)
+// entirely, since `unmount_op` takes `handle_count` as a plain caller-
+// supplied argument, not something it re-queries itself. This is real
+// code under test, not a mock: the `--lazy` gate is the FIRST thing
+// `unmount_op` evaluates once `handle_count > 0`, and it returns before
+// ever reaching step 1's `syscall` instruction -- see tests/README.md
+// for why every driver in this tree stays out of `unmount_op`'s
+// syscall-reaching `handle_count == 0` pipeline.
+//
+// Asserts two things:
+//   1. The return value is `UnmountOp::UO_RC_DEFERRED` (4).
+//   2. The written stub_mask has `UO_STUB_LAZY_DEFERRED` (0x20) set.
+//
+// Return-code convention (matches tests/README.md): 0 = both
+// assertions passed; 1 = assertion 1 failed (wrong return code); 2 =
+// assertion 2 failed (stub bit not set).
+//
+// paideia-as encoder notes: no `add reg,[mem]` anywhere. No `test`
+// mnemonic -- the stub-bit check uses `and` + `cmp reg,0`. Label prefix
+// `tls_` (TestLazyStub).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.4 (paideia-os);
+// src/unmount_op.pdx (this repo, M3-001 #7 -- the function under test).
+
+module TestLazyStub = structure {
+
+  pub let mut tls_stub_mask : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M3-001 (#7): TestLazyStub::run entry point. `lea rcx,[rip+tls_stub_mask]` (out_stub_mask_ptr); rdi=1 (mount_id, arbitrary nonzero), rsi=1 (umount_flags = PA_FLAG_LAZY), rdx=1 (handle_count, the explicit nonzero value that drives the DEFERRED gate); `call unmount_op` (src/unmount_op.pdx) -> rax. `cmp rax,4; jne tls_case1_fail` (UnmountOp::UO_RC_DEFERRED). `lea r11,[rip+tls_stub_mask]; mov rax,[r11]; and rax,0x20; cmp rax,0; je tls_case2_fail` (UO_STUB_LAZY_DEFERRED bit set). Falls through to `xor rax,rax; ret` (0, both passed). No `add reg,[mem]`. No `test`. Label prefix tls_.",
+      block: {
+        lea rcx, [rip + tls_stub_mask];
+        mov rdi, 1;                          // mount_id (arbitrary nonzero)
+        mov rsi, 1;                          // umount_flags = PA_FLAG_LAZY
+        mov rdx, 1;                          // handle_count (nonzero -- drives the gate)
+        call unmount_op;
+
+        cmp rax, 4;                          // UnmountOp::UO_RC_DEFERRED
+        jne tls_case1_fail;
+
+        lea r11, [rip + tls_stub_mask];
+        mov rax, [r11 + 0];
+        and rax, 0x20;                       // UnmountOp::UO_STUB_LAZY_DEFERRED
+        cmp rax, 0;
+        je tls_case2_fail;
+
+        xor rax, rax;                        // 0: both assertions passed
+        ret;
+
+      tls_case1_fail:
+        mov rax, 1;
+        ret;
+
+      tls_case2_fail:
+        mov rax, 2;
+        ret;
+      }
+    }
+}

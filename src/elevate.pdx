@@ -37,19 +37,86 @@
 //   takes for `libpdx-argv` at M1) -- confirm with main before that
 //   issue opens, per design/architecture.md §3's own flag.
 //
-// No executable code in this file at M1 -- only the scope note above
-// and the elevate-channel kind reference below, kept here (rather than
-// only in caps.decl) so a reader of src/ finds the deferred entry
-// point's future home without having to cross-reference caps.decl.
+// ----------------------------------------------------------------------
+// umount.pdxfs.M3-002 (#8) landing: fail-closed STUB, not a real
+// libpdx-elevate acquire+require sequence -- same posture mkfs.pdxfs's
+// M3-005 (#12) elevate_wire.pdx documents in full
+// ----------------------------------------------------------------------
 //
-// Upstream: design/tooling/volume-tooling-ux.md §5.2 + §8.2 (paideia-os).
+// `libpdx-elevate` (paideia-satellites/libpdx-elevate) DOES now exist
+// as a real, mature library -- unlike the "not yet bootstrapped" status
+// this file's M1 header described. But its real, landed API
+// (`elevate_client_acquire(caps, dur, req_buf, reply_ep_id, reply_buf,
+// mint_ctx_buf) -> row_id`) REQUIRES the caller to already hold a
+// `KIND_IPC_ENDPOINT` cap over the elevate broker, supplied as
+// `parent_ep_slot` inside a caller-populated 40-byte `mint_ctx_buf`.
+// `libpdx-elevate`'s own `caps.decl`/README are explicit that this
+// prerequisite cap is "declared by whatever the caller links this
+// library into, not by libpdx-elevate" itself. `umount.pdxfs` has no
+// such cap: this repo's own `caps.decl` (M1 landing, unchanged since)
+// declares `KIND_ELEVATE_CHANNEL` as a placeholder only -- no design
+// doc or osarch coordination point has minted this tool a real broker
+// endpoint. Without `parent_ep_slot`, there is no honest way to
+// construct a real `elevate_client_acquire` call -- fabricating one
+// against fields this repo cannot legitimately populate would look
+// real without being real (the exact trap `src/target_resolve.pdx`'s
+// own module header documents avoiding for its mount-table row).
+//
+// `elevate_request_force_unmount` below therefore ALWAYS returns
+// `ELEV_DENY` -- an honest, fail-closed answer to "can this process
+// prove it holds elevation to force-unmount past open handles", since
+// "cannot construct a real request" and "cannot prove GRANT" collapse
+// to the same externally observable outcome. `ELEV_GRANT` and the
+// caller-side GRANT arm (`src/unmount_op.pdx`'s handle-revoke stub) are
+// real, wired code paths kept for the day a broker-endpoint cap exists
+// -- only this function's body needs to change to a real
+// `elevate_client_acquire` + `elevate_client_require` sequence.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic. Pure leaf: no
+// branch, no label needed.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.2 + §8.2 (paideia-os);
+// paideia-satellites/libpdx-elevate README.md "Callers" section +
+// caps.decl (the parent_ep_slot prerequisite); mkfs.pdxfs's own
+// src/elevate_wire.pdx (M3-005, #12 -- the identical fail-closed
+// posture over the identical missing-broker-cap gap).
 
 module Elevate = structure {
 
   // KIND_ELEVATE_CHANNEL = 0x191 (src/kernel/core/cap/kind_elevate_channel.pdx,
   // R48b, derived over KIND_IPC_ENDPOINT base 5). Referenced here purely
-  // as documentation cross-reference for the future M3-002 entry point;
-  // not consumed by any M1 code path (see caps.decl's own note on the
-  // same kind).
+  // as documentation cross-reference; not consumed by any code path in
+  // this file (see caps.decl's own note on the same kind).
   pub let KIND_ELEVATE_CHANNEL_REF : u64 = 0x191
+
+  // --- elevate_request_force_unmount return values. -----------------------
+  pub let ELEV_DENY  : u64 = 0
+  pub let ELEV_GRANT : u64 = 1
+
+  // ==========================================================================
+  // elevate_request_force_unmount(mount_id) -> u64
+  //   (ELEV_DENY | ELEV_GRANT -- see module header: DENY is the only
+  //   value this landing's body can ever produce)
+  //
+  //   rdi = mount_id  (unused by this landing's body -- kept as a
+  //                     parameter so a future real body has it
+  //                     available without an ABI change, since a real
+  //                     elevate_client_acquire call would need it for
+  //                     audit/logging context)
+  //
+  // Pure leaf, no branches, no nested call, no push/pop.
+  // ==========================================================================
+  pub let elevate_request_force_unmount : (u64) -> u64 !{} @{} =
+    fn (mount_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "umount.pdxfs.M3-002 (#8): elevate_request_force_unmount entry point. mount_id (rdi) is accepted but READ BY NOTHING in this landing's body -- see module header for why no real elevate_client_acquire/elevate_client_require call can be honestly constructed yet (no broker-endpoint cap in this tool's caps.decl). `mov rax, 0` (ELEV_DENY) unconditionally; `ret`. Pure leaf -- no push/pop, no `add reg,[mem]`, no `test`. No labels needed (no branch).",
+      block: {
+        mov rax, 0;                          // ELEV_DENY (fail-closed; see module header)
+        ret;
+      }
+    }
 }

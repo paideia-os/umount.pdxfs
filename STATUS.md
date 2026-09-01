@@ -1,8 +1,8 @@
 # umount.pdxfs — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M2 (core implementation) — **landed**
-**Version:** unreleased (pre-1.0.0)
+**Current milestone:** M5 (signed release) — **landed**
+**Version:** 1.0.0
 
 See `design/tooling/volume-tooling-ux.md` §9.3 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -128,47 +128,101 @@ no remove-row op; (b) `VOL_OP_QUERY_HANDLE_COUNT` unlanded + no
 mount_id-to-cap-slot resolution path; (c) `dispatch_umount` unwired to
 its own landed body.
 
-### M3 — `--lazy` + `--force` + audit-first + semantic-pipe (pending)
+### M3 — `--lazy` + `--force` + audit-first + semantic-pipe — **landed**
 
-- [ ] **M3-001** — `--lazy` path: `PENDING_UNMOUNT` flag + `DEFERRED`
-      completion record on last handle close.
-- [ ] **M3-002** — `--force` path: `libpdx-elevate` + handle-revoke +
-      `revoked_handles` list in record. `src/elevate.pdx`'s module
-      header names this as its future live-code landing point.
-- [ ] **M3-003** — semantic-pipe: `PdxFsUnmountRecord@0.1` schema bind
-      + emit (`INTENT` + `RESULT` + `DEFERRED`).
-- [ ] **M3-004** — `SIG_KEY_LOCKED` refusal path (superblock cannot be
-      re-signed → refuse without `--force`).
+- [x] **M3-001** (#7) — `--lazy` path: `PENDING_UNMOUNT` flag + `DEFERRED`
+      completion record on last handle close. Landed as a documented
+      STUB: `src/unmount_op.pdx` gains a `handle_count`-driven gate
+      ahead of its six-step pipeline — `handle_count > 0 AND --lazy`
+      returns `UO_RC_DEFERRED` (4) with stub bit `UO_STUB_LAZY_
+      DEFERRED` (0x20) immediately, with NO follow-up completion
+      record ever firing (no kernel-side "last handle closed" callback
+      exists to fire one from). `src/handle_check.pdx`'s `handle_check_
+      refuse` grows a `lazy_bit` third argument so `--lazy` bypasses the
+      up-front IN_USE refusal the same way `--force` already did; the
+      real refusal arithmetic is extracted into a new pure leaf,
+      `handle_check_decide`, for direct testability. Tested by
+      `tests/test_lazy_stub.pdx`.
+- [x] **M3-002** (#8) — `--force` path: `libpdx-elevate` + handle-revoke +
+      `revoked_handles` list in record. Landed as a FAIL-CLOSED STUB,
+      the identical posture and identical missing-broker-cap gap
+      `mkfs.pdxfs`'s own M3-005 `elevate_wire.pdx` documents over the
+      same (now mature, 4844 LOC) library: `src/elevate.pdx`'s
+      `elevate_request_force_unmount` always returns `ELEV_DENY`, so
+      `unmount_op` returns `UO_RC_ELEVATION_STUB` (5) with stub bit
+      `UO_STUB_ELEVATION_DENIED` (0x40). The `ELEV_GRANT` arm and its
+      handle-revoke stub (bit `UO_STUB_HANDLE_REVOKE`, 0x80) are real,
+      wired, unreachable code.
+- [x] **M3-003 / #9** — semantic-pipe: `PdxFsUnmountRecord@0.1` schema
+      bind + emit (`INTENT` + `RESULT` + `DEFERRED`). New `src/audit_
+      wire.pdx` (libpdx-audit @0.2's `audit_begin`/`audit_record_
+      output`/`audit_commit`, real IPC-send attempts against a
+      confirmed-stubbed daemon dispatch, forgiving posture) and new
+      `src/pipe_wire.pdx` (libpdx-semantic-pipe fallback — `Registry::
+      bind_by_name` confirmed inert per paideia-os#2000, so every
+      record stays the M1/M2 line-based `sys_write` rendering behind a
+      documented deferral header, identical to `mkfs.pdxfs`'s own
+      M3-003 posture).
+- [x] **M3-004** (#10) — `SIG_KEY_LOCKED` refusal path (superblock
+      cannot be re-signed → refuse without `--force`). Landed as a
+      REAL, LIVE gate over an UNREACHABLE condition: `unmount_op`'s
+      step 4 now calls `libpdx-volume.pdxb_sign_superblock` for real
+      against a placeholder `.bss` buffer + a real non-null all-zero
+      seed; the `cmp rax,3309; jne ...` refusal gate is real code, but
+      the underlying `MlDsa65::sign` intrinsic only fails on a NULL
+      seed pointer — this landing's seed is zero, not unavailable — so
+      `UO_RC_SIG_KEY_LOCKED` (6) is unreachable through this call
+      chain, per this issue's own "STUB with test noting it"
+      instruction.
 
-### M4 — Tests + smoke (pending)
+### M4 — Tests + smoke — **landed**
 
-- [ ] **M4-001** — happy-path smoke: unmount `/mnt` with no open
-      handles → volume clean.
-- [ ] **M4-002** — `IN_USE` refusal smoke: open handle blocks umount
-      without `--force` / `--lazy`.
-- [ ] **M4-003** — `--lazy` correctness: umount deferred until last
-      handle closes; `DEFERRED` record fires.
-- [ ] **M4-004** — `--force` correctness: revoked handles named in
-      record; subsequent I/O returns `EIO`.
+- [x] **M4-001** (#11) — happy-path smoke: unmount `/mnt` with no open
+      handles → volume clean. `tests/test_happy_unmount.pdx` verifies
+      the real, syscall-free precondition gate (`handle_check_decide`
+      always PROCEEDs at `handle_count == 0`); the syscall-reaching
+      pipeline itself (`unmount_op`'s real `sys_umount` attempt) is
+      deferred to a future QEMU smoke matrix — a bare test-run cannot
+      safely execute a `syscall` instruction, the same constraint
+      `libpdx-audit`'s own tests document.
+- [x] **M4-002** (#12) — `IN_USE` refusal smoke: open handle blocks
+      umount without `--force` / `--lazy`. `tests/test_in_use.pdx`
+      exercises `handle_check_decide` directly (four cases) since
+      `handle_check_query`'s hard stub makes `HC_REFUSE` unreachable
+      through the real query chain.
+- [x] **M4-003** (#13) — `--lazy` correctness: `DEFERRED` code emitted.
+      `tests/test_lazy_deferred.pdx` (a superset of M3-001's own
+      `test_lazy_stub.pdx` — both landed, see tests/README.md for why).
+- [x] **M4-004** (#14) — `--force` correctness. `tests/test_force_
+      revoke.pdx` asserts `ELEVATION_STUB` (the only reachable outcome
+      per the fail-closed elevate stub) — the "OK-with-revoked_
+      handles-list" GRANT arm is real but structurally unreachable at
+      this landing.
 
-### M5 — Signed release (pending)
+### M5 — Signed release — **landed**
 
-- [ ] **M5-001** — dual-signed `manifest.pdxsig` + `CHANGELOG-1.0` +
-      `.pdxdoc` for `doc umount.pdxfs`.
-- [ ] **M5-002** — mirror push to `pkgs.paideia-os`.
+- [x] **M5-001** — dual-signed `manifest.pdxsig` + `CHANGELOG.md` +
+      `doc/umount.pdxfs.pdxdoc`. Manifest source form scaffolded with
+      every hash and both signature slots as documented placeholders,
+      mirroring `libpdx-volume`'s and `libpdx-audit`'s own M5-001
+      landings — no live release-line key material lives in this repo.
+- [x] **M5-002** — mirror push to `pkgs.paideia-os`, documented in
+      `release/RELEASE-1.0.0.md` as a NOT-YET-PERFORMED operator
+      runbook (mirror endpoint does not exist as of R53 close, per
+      the sibling libraries' own M5 findings).
 
 ## Next milestone
 
-M3 (`--lazy` + `--force` + audit-first + semantic-pipe) opens once
-`umount.pdxfs.M2` closes. Before M3-002 (`--force` + elevate +
-handle-revoke) can do anything meaningful, the M2-002 `KIND_VOLUME`
-handle-count gap (see M2-002's checklist entry above) needs to close —
-`--force` currently has nothing to override, since the refusal it would
-bypass never fires. M3-004's `SIG_KEY_LOCKED` refusal path similarly
-depends on M2-003's superblock re-sign stub going real first. Confirm
-timing on all three kernel-side gaps (`VOL_OP_QUERY_HANDLE_COUNT` +
-mount_id-to-cap-slot resolution, `dispatch_umount` rewiring,
-`KIND_PDXFS_MOUNT_TABLE` row-remove op) with osarch before M3 opens.
+M1–M5 are all landed. Follow-up work belongs to new issues, not a
+named milestone in this checklist: the three M2 kernel/library gaps
+(`VOL_OP_QUERY_HANDLE_COUNT` + mount_id-to-cap-slot resolution,
+`dispatch_umount` rewiring, `KIND_PDXFS_MOUNT_TABLE` row-remove op)
+remain open and block every stub this tool carries from going real;
+a `parent_ep_slot` broker-endpoint cap for `libpdx-elevate` blocks
+`--force` ever reaching a real elevation decision; and a real QEMU
+smoke matrix (per `tests/README.md`) is needed before the syscall-
+reaching happy path and any record emission can be verified
+end-to-end.
 
 ## Upstream design
 

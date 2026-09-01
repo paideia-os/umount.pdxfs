@@ -354,7 +354,7 @@ cross-module-referenced; this codebase has no precedent for that) in
 numeric vocabulary across files without a language-level shared
 constant.
 
-### 11.5 `main.pdx` wiring + exit codes
+### 11.5 `main.pdx` wiring + exit codes (M2; see §12.6 for the M3 superseding wiring)
 
 `main.pdx`'s M2 pipeline (label `umnt_main_run`, reached whenever
 `--dry-run` is not set) chains `target_resolve` ->
@@ -371,3 +371,134 @@ to hold `unmount_op`'s result code across the `unmount_record_emit_
 result` call — both documented in `main.pdx`'s own module header and
 safe because none of the M2 helper functions touch `r13`/`r14`
 un-restored (see each file's own leaf/push-pop contract).
+
+## 12. M3 landing (#7/#8/#9/#10) — `--lazy`, `--force`, audit-first, semantic-pipe, `SIG_KEY_LOCKED`
+
+Two new source files (`src/audit_wire.pdx`, `src/pipe_wire.pdx`), three
+extended ones (`src/handle_check.pdx`, `src/unmount_op.pdx`,
+`src/unmount_record.pdx`), one file promoted from a documentation-only
+placeholder to a real (fail-closed) function (`src/elevate.pdx`), and a
+rewired `src/main.pdx`. Every M2 kernel/library gap (§11) is still
+open — M3 adds three NEW result codes and their own stub postures on
+top, none of which close any of those three gaps.
+
+### 12.1 `handle_check.pdx` — `handle_check_decide` extracted, `lazy_bit` added
+
+`handle_check_refuse` grows a third argument, `lazy_bit`, alongside
+`force_bit` — `--lazy` now bypasses the up-front IN_USE refusal exactly
+like `--force` already did, for a different downstream reason (defer,
+not revoke). The actual `handle_count > 0 AND !force AND !lazy ->
+REFUSE` arithmetic is extracted into a new pure leaf, `handle_check_
+decide(handle_count, force_bit, lazy_bit)`, specifically so a test
+driver can exercise the real decision logic with an explicit
+`handle_count` — `handle_check_query`'s hard stub (unchanged from M2)
+still always returns 0, so `handle_check_refuse`'s own top-level call
+chain still cannot reach `HC_REFUSE`; `handle_check_decide` is the same
+real code, directly callable. `tests/test_in_use.pdx` (M4-002, #12)
+exercises exactly this.
+
+### 12.2 `elevate.pdx` — promoted from inert placeholder to a real fail-closed stub
+
+`libpdx-elevate` (paideia-satellites/libpdx-elevate) is now a mature,
+released library — a real change from M1's "not yet bootstrapped"
+status. But its real API (`elevate_client_acquire`) requires a
+`parent_ep_slot` broker-endpoint cap this repo's own `caps.decl` has
+never declared (`KIND_ELEVATE_CHANNEL` remains the M1 placeholder).
+`elevate_request_force_unmount(mount_id) -> ELEV_DENY|ELEV_GRANT`
+therefore always returns `ELEV_DENY` — the identical fail-closed
+posture, over the identical missing-cap gap, that `mkfs.pdxfs`'s own
+M3-005 `elevate_wire.pdx` documents for the same library. The
+`ELEV_GRANT` arm and its caller-side handle-revoke stub
+(`src/unmount_op.pdx`) are real, wired, unreachable code, kept for the
+day a broker-endpoint cap exists.
+
+### 12.3 `unmount_op.pdx` — a new gate ahead of the six-step pipeline, plus a real step 4
+
+`unmount_op` grows a third argument, `handle_count`, and a gate ahead
+of its existing six steps: `handle_count > 0 AND lazy_bit` returns
+`UO_RC_DEFERRED` (4) with stub bit `UO_STUB_LAZY_DEFERRED` (0x20) —
+real "wait for last handle to close" semantics need a kernel callback
+that does not exist, so the record is emitted immediately with no
+follow-up completion record ever firing (documented, not silently
+absent). `handle_count > 0 AND force_bit` calls `Elevate::
+elevate_request_force_unmount` for real; on the only reachable outcome
+(`ELEV_DENY`), returns `UO_RC_ELEVATION_STUB` (5) with stub bit
+`UO_STUB_ELEVATION_DENIED` (0x40). Both arms return BEFORE step 1's
+`syscall` — the six-step pipeline is untouched by either.
+
+Step 4 (superblock re-sign) is upgraded from M2's pure stub to a REAL
+`libpdx-volume.pdxb_sign_superblock` call against a local, deliberately
+placeholder 4096-byte `.bss` buffer and a real (non-null) all-zero
+32-byte seed buffer — the same "real, safe, wired call against an
+honest placeholder input" pattern `target_resolve.pdx` already
+established for `mount_table_snapshot`. The gate this issue (#10) asks
+for — "if `pdxb_sign_superblock` returns an error, emit
+`SIG_KEY_LOCKED` and refuse" — is real and live (`cmp rax,3309; jne
+umnt_op_sign_locked`), but the underlying `MlDsa65::sign` intrinsic
+only fails on a NULL `seed_ptr`, and this buffer is never null — "the
+seed is all-zero" and "the seed is unavailable" are different
+conditions, and this landing only has the former. `UO_RC_SIG_KEY_
+LOCKED` (6) is therefore unreachable through this call chain, exactly
+as this issue's own instruction anticipated.
+
+### 12.4 `unmount_record.pdx` — three new result codes
+
+`UR_RC_DEFERRED` (4), `UR_RC_ELEVATION_STUB` (5), `UR_RC_SIG_KEY_
+LOCKED` (6) join the M2 four, each with its own literal word
+("DEFERRED", "ELEVATION_STUB", "SIG_KEY_LOCKED") in `unmount_record_
+emit_result`'s cmp chain. Deliberately duplicated (not cross-module-
+referenced) in `unmount_op.pdx`'s `UO_RC_*`, per this repo's
+established convention.
+
+### 12.5 `audit_wire.pdx` + `pipe_wire.pdx` — new, mirroring `mkfs.pdxfs`'s M3 shape
+
+`audit_wire.pdx` wraps `libpdx-audit @0.2`'s `audit_begin` (the INTENT
+record, opened once before any dispatch, with a `--lazy`/`--force`-
+aware `op_name`), `audit_record_output` (the DEFERRED mid-lifecycle
+marker, fired exactly once on the `--lazy` DEFERRED arm), and
+`audit_commit` (the RESULT record, closed on every terminal path) —
+this issue's own "INTENT + RESULT + DEFERRED emissions" vocabulary
+maps onto these three calls one-for-one. Same forgiving posture as
+`mkfs.pdxfs`'s own `audit_wire.pdx`: every outcome (including the
+daemon-side dispatch still being stubbed, per `libpdx-audit`'s own
+STATUS.md) is non-fatal.
+
+`pipe_wire.pdx` is the `libpdx-semantic-pipe` fallback, identical
+posture to `mkfs.pdxfs`'s own M3-003 landing: `Registry::bind_by_name`
+is confirmed inert (paideia-os#2000), so every `PdxFsUnmountRecord@0.1`
+this tool emits remains the M1/M2 line-based `sys_write` rendering,
+now preceded by one documented deferral header line. One function,
+`umnt_sp_emit_result`, serves both the RESULT and DEFERRED emissions
+(#9's own vocabulary) — they are the identical five-field wire shape,
+differing only in which `result_code` the caller passes.
+
+### 12.6 `main.pdx` — M3 wiring (supersedes §11.5)
+
+`_start` now opens the INTENT audit record immediately after argv
+parsing (before any target classification), and every terminal path —
+dry-run, MOUNT_NOT_FOUND, IN_USE, OK, KERNEL_ERROR, and the three new
+M3 codes — routes through `pipe_wire.pdx`'s emitters and closes with
+`audit_wire.pdx`'s `umnt_audit_commit`. `unmount_op`'s new result codes
+map to three new exit statuses: `7` = `ELEVATION_STUB`, `8` = `SIG_
+KEY_LOCKED`; `UO_RC_DEFERRED` maps to exit `0` (real `umount -l`
+semantics: a successful lazy schedule, not an error). One correctness
+note: `unmount_op`'s own `UO_RC_KERNEL_ERROR` numeric value (2) is the
+RECORD's `result_code`, not the process exit status (6) — `main.pdx`
+overwrites its own result-code register to the real exit status
+immediately after the `pipe_wire` emit call, so `audit_commit` and
+`sys_exit` see the same value the exit-code table promises.
+
+## 13. Test suite (M3-001 #7 landing check + M4 #11-#14)
+
+Five drivers under `tests/` — see `tests/README.md` for the full
+write-up, including why the file count is five rather than the four
+the M3-M5 task brief separately counted (both `test_lazy_stub.pdx` and
+`test_lazy_deferred.pdx` are explicitly named by their own issues, #7
+and #13, and cover genuinely different scope). Every driver stays
+inside the real, syscall-free subset of this repo's own logic
+(`handle_check_decide`, `elevate_request_force_unmount`, and
+`unmount_op`'s `handle_count > 0` gate, which returns before ever
+reaching step 1's `syscall`) — the syscall-reaching happy-path pipeline
+and every record emission are deferred to a future QEMU smoke matrix,
+matching `mkfs.pdxfs`'s and `libpdx-audit`'s own still-deferred M4
+QEMU protocols.

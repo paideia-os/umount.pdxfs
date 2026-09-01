@@ -1,0 +1,116 @@
+%%% pdxdoc-source v0.1
+%%% This is the source form of the .pdxdoc file that `doc umount.pdxfs`
+%%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
+%%% §5.3); the M5-001 source lives in the repo under version control
+%%% and the release tool ships the compiled `.pdxdoc` alongside the
+%%% binary into /pkgs/umount.pdxfs-1.0.0/doc/umount.pdxfs.pdxdoc.
+%%%
+%%% Section markers: a bare `==== <title>` line opens a section. Cross-
+%%% references use `[[cref: <target>]]` where <target> is either a
+%%% doc-local section title or a `<tool>#<section>` fully-qualified
+%%% reference the reader resolves against /system/doc/. POSIX-difference
+%%% annotations use a `[[posix: <difference>]]` inline tag.
+
+==== NAME
+umount.pdxfs — detach a mounted PdxFS v1 volume.
+
+==== SYNOPSIS
+    umount.pdxfs [--lazy] [--force] [--verbose] [--dry-run] <mount-id | mount-point>
+
+==== DESCRIPTION
+`umount.pdxfs` resolves a `<mount-id | mount-point>` target to a
+`_mount_table[]` slot, checks the volume's open-handle count, drives a
+`sys_umount` attempt plus a clean-checkpoint/re-sign/row-remove
+sequence, and prints a `PdxFsUnmountRecord@0.1` line describing the
+outcome. It is the reversal of `mount.pdxfs` (and, transitively, of
+`mkfs.pdxfs`) — see `[[cref: mkfs.pdxfs#NAME]]` and
+`[[cref: mount.pdxfs#NAME]]`.
+
+A `<mount-id>` is the u64 value a prior `PdxFsMountRecord@0.1`'s
+`mount_id` field carried (confirmed to equal the real `_mount_table[]`
+slot index `sys_mount` itself returns — there is no separate persistent
+allocator). A `<mount-point>` is a VFS path; at this release, resolving
+a path to a mount_id always fails (`MOUNT_NOT_FOUND`) — the real
+per-slot mount-table layout carries no path-comparable field. Pass the
+numeric `<mount-id>` instead until this closes; see
+`[[cref: LIMITATIONS]]`.
+
+==== FLAGS
+    --lazy       Do not refuse an unmount over open handles; defer
+                 instead. At this release the deferral is emitted
+                 (result_code: DEFERRED) but no completion record ever
+                 follows — see [[cref: LIMITATIONS]].
+    --force      Bypass the open-handle refusal by revoking handles,
+                 subject to an elevation check for protected mount
+                 points. At this release the elevation check is
+                 fail-closed (no broker-endpoint capability exists for
+                 this tool to request elevation with) — every --force
+                 invocation over open handles returns
+                 result_code: ELEVATION_STUB. See [[cref: LIMITATIONS]].
+    --verbose    Parsed, not yet consumed by any output path.
+    --dry-run    Print the PdxFsUnmountRecord@0.1 line that would be
+                 emitted, without unmounting anything. Always exits 0.
+
+==== EXIT CODES
+     0   OK — the target unmounted (or a --dry-run preview / --lazy
+         schedule; see [[cref: LIMITATIONS]] for what "unmounted" means
+         at this release's stub coverage).
+     2   Missing the required <mount-id | mount-point> positional.
+     3   MOUNT_NOT_FOUND — the target did not resolve to a mount-table
+         slot.
+     5   IN_USE — open handles block the unmount and neither --force
+         nor --lazy was given.
+     6   KERNEL_ERROR — sys_umount returned a genuine (non-stub) error.
+     7   ELEVATION_STUB — --force was given but the fail-closed
+         elevation check denied it.
+     8   SIG_KEY_LOCKED — the superblock could not be re-signed.
+         Unreachable at this release; see [[cref: LIMITATIONS]].
+
+==== RECORD FORMAT
+Every non-dry-run invocation prints one deferral header line (semantic-
+pipe binding is not yet live; see [[cref: LIMITATIONS]]) followed by:
+
+    PdxFsUnmountRecord@0.1 { target: <t>, mount_id: <id>,
+      result_code: <OK|IN_USE|KERNEL_ERROR|MOUNT_NOT_FOUND|DEFERRED|
+                     ELEVATION_STUB|SIG_KEY_LOCKED>,
+      handle_count: <n>, stub_mask: <bits> }
+
+`stub_mask` documents exactly which of `umount.pdxfs`'s own six
+teardown substeps ran for real vs. stubbed for this invocation — see
+`[[cref: LIMITATIONS]]` for the bit table.
+
+==== LIMITATIONS
+This release's stub coverage, spelled out so a caller does not mistake
+absence for a bug:
+
+  - **`<mount-point>` path resolution** always fails. Pass the numeric
+    `<mount-id>` instead.
+  - **Open-handle counting** always reports 0 — no kernel op exists to
+    query it yet, and no way exists to derive which capability a
+    resolved mount_id even corresponds to. The `IN_USE` refusal is real
+    logic that never fires through the real query path.
+  - **`sys_umount` itself** is dispatched but the kernel's own dispatch
+    table has never been wired to the (otherwise complete) syscall
+    body — every real attempt observes a stubbed `-ENOSYS`, recorded in
+    `stub_mask` bit 0x1, and the tool proceeds as if it had succeeded.
+  - **Cache flush, transaction drain, and CLEAN checkpoint** (bits
+    0x2, 0x4) have no kernel primitive at all.
+  - **Superblock re-sign** (bit 0x8) runs a REAL cryptographic sign
+    call, but against a placeholder buffer, not the genuine on-disk
+    superblock — no block-device read primitive exists for this tool.
+  - **Mount-table row removal** (bit 0x10) has no kernel op.
+  - **`--lazy`'s completion record** never fires — no kernel primitive
+    notifies a process when a volume's last handle closes.
+  - **`--force`'s elevation check** always denies — no broker-endpoint
+    capability has been granted to this tool.
+  - **`SIG_KEY_LOCKED`** cannot occur at this release — the signing
+    seed used is a real, non-null, all-zero buffer, not an unavailable
+    one, and the signing intrinsic only fails on a null seed.
+
+See `[[cref: umount.pdxfs#CHANGELOG]]` (this repo's `CHANGELOG.md`) for
+the full, itemised list with the exact source file and issue number
+each limitation traces to.
+
+==== SEE ALSO
+`[[cref: mkfs.pdxfs#NAME]]`, `[[cref: mount.pdxfs#NAME]]`,
+`[[cref: libpdx-volume#NAME]]`, `[[cref: libpdx-audit#NAME]]`.

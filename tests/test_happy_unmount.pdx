@@ -1,0 +1,107 @@
+// tests/test_happy_unmount.pdx — umount.pdxfs.M4-001 (issue #11)
+// TestHappyUnmount: happy-path smoke check.
+//
+// ----------------------------------------------------------------------
+// Why this driver does NOT invoke UnmountOp::unmount_op's real pipeline
+// ----------------------------------------------------------------------
+//
+// The happy path (`/mnt` with no open handles) reaches `unmount_op`'s
+// `handle_count == 0` branch, which falls straight into the six-step
+// pipeline (`src/unmount_op.pdx`) -- and step 1 of that pipeline issues
+// a REAL `syscall` instruction (`mov rax,76; syscall;`, sysno 76 =
+// sys_umount). Per this repo's own tests/README.md (mirroring
+// `libpdx-audit`'s identical, independently-documented constraint): a
+// bare test-run with no kernel underneath cannot safely execute a
+// `syscall` instruction -- it traps. The same applies transitively to
+// step 4's real `pdxb_sign_superblock` call (safe on its own, no
+// syscall) once step 1 has already trapped, and to every
+// `PdxFsUnmountRecord@0.1` emission in `src/pipe_wire.pdx` /
+// `src/unmount_record.pdx` (each a `sys_write` syscall).
+//
+// This driver therefore verifies the ONE real, syscall-free invariant
+// that GATES the happy path before `unmount_op` is ever reached:
+// `HandleCheck::handle_check_decide(handle_count=0, force_bit, lazy_bit)`
+// always returns `HC_PROCEED` regardless of `force_bit`/`lazy_bit` --
+// i.e. "no open handles" is unconditionally sufficient to proceed,
+// exactly the precondition this issue's own "no open handles" scenario
+// describes. The REST of the happy path -- the real `sys_umount`
+// attempt (observing the documented `-ENOSYS` stub condition per
+// `src/unmount_op.pdx`'s own module header, since `dispatch.pdx`'s
+// `dispatch_umount` remains unwired), the four stubbed substeps, the
+// real (placeholder-buffer) `pdxb_sign_superblock` call, and the
+// emitted `result_code: OK` record -- is exactly the "still fully
+// completes and emits OK" contract `unmount_op`'s own module header
+// documents, but exercising it end-to-end needs a real kernel. This is
+// deferred to a future QEMU smoke matrix, matching `mkfs.pdxfs`'s own
+// (still-empty, pre-M4) `tests/` tree and `libpdx-audit`'s own
+// documented-deferred QEMU protocol -- not a gap unique to this driver.
+//
+// Three subtests, one call each with all three (force_bit, lazy_bit)
+// combinations that leave `handle_count == 0`:
+//   1. `handle_check_decide(0, 0, 0)` -> `HC_PROCEED` (0)
+//   2. `handle_check_decide(0, 1, 0)` -> `HC_PROCEED` (0)
+//   3. `handle_check_decide(0, 0, 1)` -> `HC_PROCEED` (0)
+//
+// Return-code convention (matches tests/README.md): 0 = all three
+// subtests passed; 1..3 = the 1-based ordinal of the first failure.
+//
+// paideia-as encoder notes: no `add reg,[mem]`. No `test` mnemonic. No
+// callee-save register needs to survive across any call. Label prefix
+// `thu_` (TestHappyUnmount).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §5.3, §5.5 (paideia-os);
+// src/handle_check.pdx (this repo, the function under test);
+// src/unmount_op.pdx (this repo, the syscall-reaching pipeline this
+// driver documents as QEMU-deferred rather than invoking bare).
+
+module TestHappyUnmount = structure {
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "umount.pdxfs.M4-001 (#11): TestHappyUnmount::run entry point. Three flat, independent calls to HandleCheck::handle_check_decide with handle_count pinned at 0 and force_bit/lazy_bit varied across all three nonzero-flag combinations that still leave handle_count==0 -- (0,0,0), (0,1,0), (0,0,1) -- each expecting HC_PROCEED (0); `cmp rax,0; jne caseK_fail` after each call. No register needs to survive across any of the three calls, so no push/pop. Returns 0 if all three passed, else the 1-based ordinal of the first failure. The real syscall-reaching happy-path pipeline (UnmountOp::unmount_op's handle_count==0 branch) is deliberately NOT invoked here -- see module header for why a bare test-run cannot safely execute its `syscall` instruction, and tests/README.md for the QEMU-deferred posture this shares with mkfs.pdxfs and libpdx-audit. No `add reg,[mem]`. No `test`. Label prefix thu_.",
+      block: {
+        // ---- Subtest 1: (0, 0, 0) -> PROCEED. ---------------------------------
+        mov rdi, 0;                          // handle_count
+        mov rsi, 0;                          // force_bit
+        mov rdx, 0;                          // lazy_bit
+        call handle_check_decide;
+        cmp rax, 0;                          // HandleCheck::HC_PROCEED
+        jne thu_case1_fail;
+
+        // ---- Subtest 2: (0, 1, 0) -> PROCEED. ---------------------------------
+        mov rdi, 0;
+        mov rsi, 1;
+        mov rdx, 0;
+        call handle_check_decide;
+        cmp rax, 0;
+        jne thu_case2_fail;
+
+        // ---- Subtest 3: (0, 0, 1) -> PROCEED. ---------------------------------
+        mov rdi, 0;
+        mov rsi, 0;
+        mov rdx, 1;
+        call handle_check_decide;
+        cmp rax, 0;
+        jne thu_case3_fail;
+
+        xor rax, rax;                        // 0: all three subtests passed
+        ret;
+
+      thu_case1_fail:
+        mov rax, 1;
+        ret;
+
+      thu_case2_fail:
+        mov rax, 2;
+        ret;
+
+      thu_case3_fail:
+        mov rax, 3;
+        ret;
+      }
+    }
+}
