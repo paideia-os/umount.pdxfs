@@ -1,16 +1,26 @@
-# umount.pdxfs v1.0.0 — release manifest (source form)
+# umount.pdxfs v1.1.0 — release manifest (source form)
+#
+# v1.1.0 is an adoption-only minor bump over v1.0.0 (see CHANGELOG.md
+# 1.1.0 stanza, and this repo's #21): libpdx-volume v1.1 API cleanup
+# consts (PDXB_ONDISK_BYTES, PDXB_SIGN_MSG_LEN, MLDSA65_SIG_LEN,
+# MTE_BYTES) are now cited in place of bare byte-counts, and the v1.1
+# accessor / lpv_strerror postures are documented (see #21). Every
+# artifact hash slot below is a placeholder the release tool
+# recomputes at tag time from the working tree; the artifact SET is
+# identical to v1.0.0 (no source file added or removed at this
+# release), so no `[artifacts.*]` row moved.
 #
 # This is the human-readable source form of `manifest.pdxsig`. The
 # release tool at pkgs.paideia-os mirror-push time (a) enumerates the
 # artifact list below, (b) recomputes every BLAKE3-256 hash from the
-# repo tree at the v1.0.0 tag, (c) writes the completed manifest into
+# repo tree at the v1.1.0 tag, (c) writes the completed manifest into
 # a binary `manifest.pdxsig`, and (d) invokes
 #   paideia-pq-sign::sign_release_artifact(sk, manifest_path)
 # once with the paideia-release-line Ed25519 secret key and once with
 # the ML-DSA-65 secret key. The two detached signatures are appended
 # to the manifest in the fixed layout below and the resulting
 # `manifest.pdxsig` is pushed to
-#   https://pkgs.paideia-os/main/umount.pdxfs/1.0.0/manifest.pdxsig
+#   https://pkgs.paideia-os/main/umount.pdxfs/1.1.0/manifest.pdxsig
 # alongside the compiled artifacts.
 #
 # Format mirrors `libpdx-volume`'s and `libpdx-audit`'s own
@@ -34,18 +44,18 @@
 format-version:      1
 manifest-schema:     paideia-manifest-pdxsig@1
 package-name:        umount.pdxfs
-package-version:     1.0.0
-package-release:     R53-M5
+package-version:     1.1.0                     # bumped from 1.0.0 at #21 (libpdx-volume v1.1 API adoption)
+package-release:     R53-M5-adopt              # bumped from R53-M5 (adoption-only; no new capabilities)
 package-license:     MIT
 source-repo:         https://github.com/paideia-os/umount.pdxfs
-source-commit:       <TAG-v1.0.0-COMMIT-SHA>   # release tool fills in
-source-tag:          v1.0.0
+source-commit:       <TAG-v1.1.0-COMMIT-SHA>   # release tool fills in
+source-tag:          v1.1.0
 
 # ---------------------------------------------------------------
 # Artifact set — every file the compiled package ships. The hash
 # discipline is BLAKE3-256, upper 32 bytes rendered as 64 hex chars.
 # The release tool recomputes each hash from the working tree at the
-# v1.0.0 tag before writing the binary manifest. The order below is
+# v1.1.0 tag before writing the binary manifest. The order below is
 # stable (lexicographic within each section) so the concatenated
 # hash-input is reproducible across signers.
 # ---------------------------------------------------------------
@@ -88,7 +98,7 @@ CHANGELOG.md                       blake3-256 = <BLAKE3-CHANGELOG.md>
 # ---------------------------------------------------------------
 
 [depends-on]
-libpdx-volume       >= 1.0.0
+libpdx-volume       >= 1.1.0    # bumped at umount.pdxfs v1.1.0 (#21): LV.M1-005 consts (PDXB_ONDISK_BYTES, PDXB_SIGN_MSG_LEN, MLDSA65_SIG_LEN, MTE_BYTES)
 libpdx-audit        >= 0.2.0
 libpdx-elevate      (linked at the header level only; every call site
                      is a fail-closed stub at this release — see

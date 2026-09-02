@@ -25,9 +25,14 @@ upstream CLI spec this tool implements.
 
 ## Status
 
-**v1.0.0 — M1..M5 all landed.** See [`STATUS.md`](STATUS.md) for the
-per-issue checklist and `design/tooling/volume-tooling-ux.md` §9.3 in
-paideia-os for the full M1..M5 milestone breakdown (16 issues).
+**v1.1.0 — libpdx-volume v1.1 API adoption (#21).** All M1..M5 landed
+at v1.0.0; v1.1.0 is an adoption-only minor bump that cites the v1.1
+public consts (`PDXB_ONDISK_BYTES`, `PDXB_SIGN_MSG_LEN`,
+`MLDSA65_SIG_LEN`, `MTE_BYTES`) and documents the v1.1 accessor /
+`lpv_strerror` posture (see `CHANGELOG.md`). No wire-format, no
+behavior change. See [`STATUS.md`](STATUS.md) for the per-issue
+checklist and `design/tooling/volume-tooling-ux.md` §9.3 in paideia-os
+for the full M1..M5 milestone breakdown (16 issues).
 
 Try it (once built and linked into a runnable image):
 

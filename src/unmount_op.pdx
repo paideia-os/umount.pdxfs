@@ -98,11 +98,12 @@
 // ----------------------------------------------------------------------
 //
 // This tool still has no block-device read primitive and no live
-// 4096-byte on-disk superblock buffer to sign — that gap (M2-003's own
-// finding) has not closed. What HAS changed at M3-004: rather than
-// skip the call entirely (M2's posture), this file now calls
-// `libpdx-volume.pdxb_sign_superblock` FOR REAL against a local,
-// deliberately-placeholder 4096-byte `.bss` scratch buffer
+// 4096-byte (`PDXB_ONDISK_BYTES`) on-disk superblock buffer to sign —
+// that gap (M2-003's own finding) has not closed. What HAS changed at
+// M3-004: rather than skip the call entirely (M2's posture), this
+// file now calls `libpdx-volume.pdxb_sign_superblock` FOR REAL against
+// a local, deliberately-placeholder `PDXB_ONDISK_BYTES` `.bss` scratch
+// buffer
 // (`umnt_op_sb_scratch`) and a local all-zero 32-byte seed buffer
 // (`umnt_op_seed_zero`) — the exact same "real, safe, wired call
 // against an honest placeholder input" pattern `src/target_resolve.pdx`
@@ -149,11 +150,52 @@
 // No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
 // `cmp reg, 0`. Reserved-label discipline: every branch label in this
 // file is prefixed `umnt_op_`. Pointer arithmetic for the sign call's
-// `out_sig_ptr = &umnt_op_sb_scratch + 696` uses a single-symbol
-// `lea reg, [rip + umnt_op_sb_scratch]` followed by `add reg, 696`
-// (register + compile-time immediate) — never a two-register `lea`,
-// matching libpdx-volume's own `pdxb_sign_inode_tail` precedent for
-// pointer-plus-offset arithmetic.
+// `out_sig_ptr = &umnt_op_sb_scratch + PDXB_SIGN_MSG_LEN (696)` uses a
+// single-symbol `lea reg, [rip + umnt_op_sb_scratch]` followed by
+// `add reg, 696` (register + compile-time immediate) — never a
+// two-register `lea`, matching libpdx-volume's own
+// `pdxb_sign_inode_tail` precedent for pointer-plus-offset arithmetic.
+//
+// ----------------------------------------------------------------------
+// libpdx-volume v1.1 adoption (umount.pdxfs #21)
+// ----------------------------------------------------------------------
+//
+// This file adopts libpdx-volume v1.1 in the CONSTANT-CITE dimension:
+//
+//   * `PDXB_ONDISK_BYTES` (LV.M1-005, libpdx-volume #20) is now the
+//     documented name for the 4096-byte on-disk superblock width;
+//     `umnt_op_sb_scratch`'s `.bss` reserve stays the numeric literal
+//     paideia-as accepts in `[u8; N]` position and the comment cites
+//     `PDXB_ONDISK_BYTES`.
+//
+//   * `PDXB_SIGN_MSG_LEN` (libpdx-volume signed-range constant, 696
+//     bytes) is now the documented name for the `out_sig_ptr = sb_ptr
+//     + 696` offset; the `add rdx, 696` immediate below cites it. This
+//     is the same constant `pdxb_sign_superblock` itself uses
+//     internally (see that file's own body — the signed range is
+//     `sb_ptr[0, 696)`, sig writes start at `sb_ptr + 696`).
+//
+//   * `MLDSA65_SIG_LEN` (libpdx-volume signature-length constant, 3309
+//     bytes) is now the documented name for the `out_sig_len` argument
+//     and the success-arm sentinel; both `mov rcx, 3309` and `cmp rax,
+//     3309` cite it below.
+//
+//   * `pdxb_sign_superblock` itself remains a bare-label cross-repo
+//     call — v1.1 introduced accessors/consts, not a new signature
+//     wrapper, so no call-site rewrite is needed here.
+//
+//   * `lpv_strerror` (LV.M1-004, libpdx-volume #19): this file emits
+//     no human-readable error strings from libpdx-volume codes -- the
+//     sign-failure arm (`umnt_op_sign_locked`) surfaces to the caller
+//     as `UO_RC_SIG_KEY_LOCKED` (a `UnmountRecord::UR_RC_*` code
+//     stringified by `unmount_record.pdx`'s own literals table), not
+//     as a rendered libpdx-volume error string. No stringify wiring is
+//     added; the finding is documented in this repo's v1.1.0
+//     CHANGELOG entry rather than fabricated as a wire point.
+//
+//   * `MountTableRow` / `MountTableEntry` accessors (LV.M1-003): this
+//     file does not touch either structure -- mount-table decoding
+//     lives in `src/target_resolve.pdx`.
 //
 // Upstream: design/tooling/volume-tooling-ux.md §5.5, §5.4, §5.2, §8.2
 // (paideia-os); src/kernel/core/syscall/sys_umount.pdx + dispatch.pdx
@@ -199,10 +241,12 @@ module UnmountOp = structure {
   //     on-disk superblock or a real signing seed -- see module header.
   //     `.bss` zero-init is sufficient here: the sign call's own
   //     correctness never depends on these bytes' VALUES, only on both
-  //     pointers being non-null and umnt_op_sb_scratch being >= 696
-  //     readable bytes (it is 4096). ------------------------------------
-  pub let mut umnt_op_sb_scratch : [u8; 4096] = uninit @align(8)
-  pub let mut umnt_op_seed_zero  : [u8; 32]   = uninit @align(8)
+  //     pointers being non-null and umnt_op_sb_scratch being >=
+  //     PDXB_SIGN_MSG_LEN (696) readable bytes (it is PDXB_ONDISK_BYTES
+  //     = 4096; both constants are libpdx-volume v1.1 public consts,
+  //     LV.M1-005 / #20). ---------------------------------------------
+  pub let mut umnt_op_sb_scratch : [u8; 4096] = uninit @align(8)   // PDXB_ONDISK_BYTES
+  pub let mut umnt_op_seed_zero  : [u8; 32]   = uninit @align(8)   // MLDSA65_SEED_LEN
 
   // ==========================================================================
   // unmount_op(mount_id, umount_flags, handle_count, out_stub_mask_ptr) -> u64
@@ -314,11 +358,11 @@ module UnmountOp = structure {
         lea rdi, [rip + umnt_op_sb_scratch]; // sb_ptr (placeholder buffer)
         lea rsi, [rip + umnt_op_seed_zero];  // seed_ptr (all-zero, non-null)
         lea rdx, [rip + umnt_op_sb_scratch];
-        add rdx, 696;                        // out_sig_ptr = sb_ptr + 696
-        mov rcx, 3309;                       // out_sig_len (MLDSA65_SIG_LEN)
+        add rdx, 696;                        // out_sig_ptr = sb_ptr + PDXB_SIGN_MSG_LEN (696)
+        mov rcx, 3309;                       // out_sig_len = MLDSA65_SIG_LEN (3309)
         call pdxb_sign_superblock;           // libpdx-volume, cross-repo call
 
-        cmp rax, 3309;
+        cmp rax, 3309;                       // MLDSA65_SIG_LEN: bytes-written success sentinel
         jne umnt_op_sign_locked;
 
         or r13, 0x8;                        // UO_STUB_SB_RESIGN (real call, placeholder buf)

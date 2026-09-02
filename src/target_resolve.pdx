@@ -99,6 +99,35 @@
 // leans on); src/kernel/core/syscall/sys_mount.pdx (mount_id ==
 // mount_slot); src/kernel/core/syscall/sys_stat.pdx (confirms no
 // ring-3 path->vnode_idx primitive exists).
+//
+// ----------------------------------------------------------------------
+// libpdx-volume v1.1 adoption (umount.pdxfs #21)
+// ----------------------------------------------------------------------
+//
+// This file adopts libpdx-volume v1.1 in the CONSTANT-CITE dimension
+// only. The v1.1 API cleanup ships three families of surface changes:
+//
+//   1. MountTableRow / MountTableEntry field accessors (LV.M1-003,
+//      libpdx-volume #18) -- `mtr_get_*` / `mte_get_*` one-line getters
+//      over the two summary layouts. This file's path branch does NOT
+//      decode any MTE fields at this landing: `mount_table_snapshot`'s
+//      Gate 1 refuses the all-zero row placeholder before the entries
+//      buffer is ever written (module header §2), so there is no live
+//      offset math to swap for `mte_get_*` calls here. When the
+//      ambient-cap-slot gap closes AND the richer per-mount record
+//      lands, this branch's post-call decode will read
+//      `mte_get_mountpoint_vnode_idx` / `mte_get_root_vnode_idx`
+//      instead of hand-crafted `[out_ptr + MTE_OFF_*]` loads.
+//
+//   2. `lpv_strerror` (LV.M1-004, libpdx-volume #19). This file emits
+//      no human-readable error strings from libpdx-volume codes -- the
+//      `mount_table_snapshot` return value is discarded per this
+//      header's §2 dead-end analysis. No stringify wiring is added.
+//
+//   3. `MTE_BYTES` (LV.M1-005, libpdx-volume #20) is the v1.1 public
+//      alias for `MTE_SUMMARY_BYTES`; the entries-scratch comment
+//      below cites it, matching the v1.1 downstream-consumer
+//      convention.
 
 module TargetResolve = structure {
 
@@ -112,7 +141,7 @@ module TargetResolve = structure {
   // into this buffer by other code cannot leave stale bytes that
   // accidentally pass mount_table_snapshot's kind gate.
   pub let mut umnt_tr_row_scratch     : [u8; 64]  = uninit @align(8)
-  pub let mut umnt_tr_entries_scratch : [u8; 320] = uninit @align(8)  // 8 * MTE_SUMMARY_BYTES(40)
+  pub let mut umnt_tr_entries_scratch : [u8; 320] = uninit @align(8)  // 8 * MTE_BYTES (v1.1 alias; == MTE_SUMMARY_BYTES = 40)
   pub let mut umnt_tr_count_scratch   : [u8; 8]   = uninit @align(8)
 
   // ==========================================================================

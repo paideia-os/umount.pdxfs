@@ -1,5 +1,46 @@
 # umount.pdxfs — CHANGELOG
 
+## 1.1.2 — 2026-09-02 (ENH-030: libpdx-argv adoption — replaces handwritten scanner)
+
+**Patch bump — no observable behaviour change for well-formed input;
+every exit code + stderr diagnostic preserved.** Replaces the
+handwritten long-flag scanner in `src/argv.pdx` with a thin wire-in
+over paideia-satellites/libpdx-argv v1.1.0 (ENH-030 rename tag). Every
+public symbol callers depend on — the `argv_parse` entry point, the
+`PA_OFF_*` / `PA_FLAG_*` / `PA_STRUCT_BYTES` constants, and every
+`ARGV_ERR_*` return code — keeps its numeric value and its byte
+offset unchanged, so `src/main.pdx`'s direct-offset loads at
+`[r14 + 0]` / `[r14 + 8]` and every `tests/` [u8; 16] ParsedArgv
+buffer continue to work byte-for-byte.
+
+### Added
+
+- **libpdx-argv wire-in** — `argv_parse` now registers the 4
+  umount.pdxfs long flags with `flag_spec_register()` (each bound to a
+  `FID_*` in the 100..103 range, all `FKIND_BOOL` — this tool has no
+  value-carrying flags), drives `parse_argv(argv+8, argc-1)`, then
+  walks `flag_ids[0..flag_count)` once to populate the caller's
+  16-byte ParsedArgv struct via a linear `cmp r10, FID_*; jne next`
+  chain.
+- **Flag-name literals** — new NUL-terminated `[u8; N]` names in
+  .rodata (`umnt_argv_name_lazy`, `_force`, `_verbose`, `_dry_run`).
+
+### Removed
+
+- **Handwritten scanner** — `argv_streq` and every `argv_lit_*`
+  literal deleted. This tool never needed `argv_prefix_match` or
+  `argv_parse_u64_dec` (all four flags are booleans), so those two
+  helpers were already absent from the pre-shim body.
+
+### Build
+
+- **`bash tools/build.sh --extra-obj-dir ../libpdx-argv/build-out
+  ...`** — the standing invocation must now include libpdx-argv's
+  build-out alongside libpdx-volume's.
+
+Closes #23 (satellite adoption of libpdx-argv). Depends on
+libpdx-argv v1.1.0 (ENH-030 rename).
+
 ## 1.1.1 — 2026-09-02 (Phase C: `--extra-archive` + `--gc-sections` for satellite-runtime link)
 
 **Patch bump — additive `tools/build.sh` flag; every existing invocation

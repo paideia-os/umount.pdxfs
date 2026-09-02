@@ -2,7 +2,7 @@
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
 **Current milestone:** M5 (signed release) — **landed**
-**Version:** 1.0.0
+**Version:** 1.1.2 (ENH-030: libpdx-argv adoption — replaces handwritten scanner, #23)
 
 See `design/tooling/volume-tooling-ux.md` §9.3 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
