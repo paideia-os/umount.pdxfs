@@ -1,19 +1,179 @@
 # umount.pdxfs — CHANGELOG
 
-## Unreleased — 2026-09-01
+## 1.1.1 — 2026-09-02 (Phase C: `--extra-archive` + `--gc-sections` for satellite-runtime link)
 
-**ELF-linking phase.** `tools/build.sh` now links `build-out/*.o`
-(this repo's own `src/*.pdx` objects) into `build-out/umount.pdxfs.elf`
-via `ld -T link.ld`, plus a matching `.bin` via `objcopy`, for
-paideia-os issue #1976/#1977 (satellite-tool boot-time `/bin` seeding
-pipeline). New `link.ld` at repo root — the same `true.ld`-derived
-layout (`.text`/`.rodata` at `0x00400000`, `.data`/`.bss` at
-`0x00600000`, `.bss` kept contiguous with `.data` per paideia-os#1595)
-every other satellite tool uses. `tools/build.sh` also gains a
-repeatable `--extra-obj-dir DIR` flag so a caller (e.g. paideia-os's
-own build, or a sibling satellite repo) can fold in dependency object
-files at link time; a missing or empty directory contributes nothing
-and is not an error. The `tests/*.pdx` objects are never linked.
+**Patch bump — additive `tools/build.sh` flag; every existing invocation
+still works unchanged.** Wires the two Phase A/B archives from
+paideia-os#2226's satellite-runtime-shim landing (paideia-as v0.29.1
+`libpaideia_satellite_runtime.a` + libpdx-audit v1.1.1
+`libpdx-audit-satellite.a`) through this repo's own final `ld` link so
+`bash tools/build.sh --extra-archive .../libpaideia_satellite_runtime.a
+--extra-archive .../libpdx-audit-satellite.a` now resolves the
+satellite-runtime symbol references (crypto FFI thunks +
+`mldsa65_sign_runtime_entry` + `audit_begin` / `audit_commit`
+satellite bodies + panic/allocator/eh_personality shim) end-to-end.
+
+### Added
+
+- **`--extra-archive PATH` (repeatable)** on `tools/build.sh`, symmetric
+  to the existing `--extra-obj-dir DIR` flag: each PATH is a static
+  archive (`.a`) appended to the final `ld` link line AFTER the
+  --extra-obj-dir loose objects. Archives are pulled in AS-NEEDED
+  (unlike loose objects, which link unconditionally), so the archive
+  contents only pay their way for symbols the ELF actually references.
+  Bounds-checks the value slot; a bare `--extra-archive` with no
+  following PATH exits 2 with `--extra-archive requires an argument`
+  (same discipline as `--extra-obj-dir`). A PATH that names a missing
+  file surfaces later as an `ld` open-failure at link time (not an
+  early parse error) — the flag validates only that the slot was
+  supplied, mirroring how `--extra-obj-dir` never validates its DIR.
+
+### Changed
+
+- **`ld` link line** — added `--gc-sections` to the `ld -nostdlib
+  --warn-common --fatal-warnings` invocation. Essential when linking
+  the Phase A staticlib: Rust archives emit per-function sections
+  (`.text.<sym>`), and `--gc-sections` walks from `_start` (KEEPed by
+  `link.ld`) and prunes every satellite-runtime symbol nothing in this
+  repo transitively references. Without it, the archive dumps unused
+  compiler-builtins/std padding into the ELF and leaves dangling refs
+  from Rust's own internal call graph. This repo's own `src/*.pdx`
+  objects emit into one big `.text` section per module, so
+  `--gc-sections` is a no-op for them (the section stays live as soon
+  as `_start` is reached).
+
+### Invocation (unchanged for callers not wiring in Phase A/B archives)
+
+```
+# Old — still works, still emits build-out/umount.pdxfs.elf against
+# just this repo's own objects (dangling refs on satellite-runtime
+# symbols surface at ld, not here):
+bash tools/build.sh --extra-obj-dir ../libpdx-volume/build-out
+
+# New — resolves every satellite-runtime ref, end-to-end link OK:
+bash tools/build.sh \
+  --extra-obj-dir ../libpdx-volume/build-out \
+  --extra-archive $HOME/Development/PaideiaOS/tools/paideia-as/target/release/libpaideia_satellite_runtime.a \
+  --extra-archive $HOME/tmp/libpdx-audit/build-out/libpdx-audit-satellite.a
+```
+
+References: paideia-os#2226, paideia-as#1348, libpdx-audit#19, design
+doc `design/infrastructure/satellite-runtime-shim.md` §4.1 + §5 Step 5.
+
+## 1.1.0 — 2026-09-02 (libpdx-volume v1.1 API adoption, #21)
+
+**Adoption-only minor release.** Adopts libpdx-volume v1.1 API cleanup
+(LV.M1-003 accessors + LV.M1-004 `lpv_strerror` + LV.M1-005 public
+consts, libpdx-volume issues #18/#19/#20). No new capabilities, no
+wire-format change, no behavior change on any code path -- every
+`PdxFsUnmountRecord@0.1` field, every `UR_RC_*` code, every exit
+status, every stub-mask bit, and every audit record shape is
+byte-for-byte identical to v1.0.0. Cascade parent: umount.pdxfs #21.
+
+### Adopted
+
+- **LV.M1-005 public consts** (libpdx-volume #20). `src/unmount_op.pdx`
+  and `src/target_resolve.pdx` now cite the v1.1 public aliases in
+  place of bare byte-counts:
+
+  * `PDXB_ONDISK_BYTES` (= 4096) for `umnt_op_sb_scratch`'s
+    superblock-shaped `.bss` reserve.
+  * `PDXB_SIGN_MSG_LEN` (= 696) for the `out_sig_ptr = sb_ptr + 696`
+    pointer arithmetic in the step-4 sign call.
+  * `MLDSA65_SIG_LEN` (= 3309) for both the `out_sig_len` argument and
+    the success-arm sentinel comparison.
+  * `MTE_BYTES` (= 40; v1.1 alias for `MTE_SUMMARY_BYTES`) for
+    `umnt_tr_entries_scratch`'s `8 * MTE_BYTES` sizing comment.
+
+  Every immediate stays numeric literal in operand position -- paideia-as
+  does not accept const-symbol immediates cross-repo (verified: no such
+  usage exists anywhere in libpdx-volume / mkfs.pdxfs / mount.pdxfs /
+  umount.pdxfs source trees), matching the family-wide "literal +
+  comment cite" convention.
+
+- **LV.M1-003 accessors** (libpdx-volume #18). No call-site rewrite
+  landed in this repo: `src/target_resolve.pdx`'s path branch does not
+  decode any `MountTableEntry` fields today -- `mount_table_snapshot`'s
+  Gate 1 refuses the all-zero row placeholder before the entries
+  buffer is ever written (that file's own module header §2, unchanged
+  from v1.0.0). The `mte_get_mountpoint_vnode_idx` /
+  `mte_get_root_vnode_idx` swap will land alongside the ambient-cap-slot
+  gap closure AND the richer per-mount record's arrival (see
+  `caps.decl` §KIND_PDXFS_MOUNT_TABLE + `design/architecture.md` §7 for
+  both gaps -- neither closed at this release). Module header of
+  `target_resolve.pdx` now documents the future-swap plan explicitly.
+
+### Not adopted (documented finding)
+
+- **LV.M1-004 `lpv_strerror`** (libpdx-volume #19). This tool emits no
+  human-readable error strings from libpdx-volume codes. Every error
+  surfaces through this repo's own `UnmountRecord::UR_RC_*` code space
+  (stringified by `src/unmount_record.pdx`'s own literals table) or an
+  exit-status integer (see `src/main.pdx`'s per-arm sys_exit table).
+  The two cross-repo call sites -- `mount_table_snapshot` in
+  `target_resolve.pdx` and `pdxb_sign_superblock` in `unmount_op.pdx`
+  -- both discard their return values into repo-local `UR_RC_*`
+  buckets (`TR_ERR_MOUNT_NOT_FOUND` / `UO_RC_SIG_KEY_LOCKED`) rather
+  than rendering the libpdx-volume code to stderr. Adding a
+  `lpv_strerror` diagnostic wire would be additive new behavior, not
+  an API cleanup swap, and is out of scope for this adoption-only
+  release. Sibling `mount.pdxfs` and `mkfs.pdxfs` cascades DO have a
+  natural `lpv_strerror` wire point (their `map_kernel_errno_to_
+  result_code` / `refusal` layers surface libpdx-volume codes to
+  users); this repo does not.
+
+### Dependency
+
+- `release/manifest.pdxsig.txt`: `libpdx-volume >= 1.0.0` bumped to
+  `>= 1.1.0`. Everything ships against libpdx-volume v1.1.1 (the
+  latest v1.1.x patch, quota input-contract + arithmetic-wrap guard;
+  every v1.1.0 API surface is preserved byte-for-byte at v1.1.1 per
+  that repo's own CHANGELOG), but the manifest floor stays at v1.1.0
+  since none of the v1.1.1 patches (`pdxb_quota_check` /
+  `pdxb_quota_commit` parameter rename + overflow guard) touch any
+  code path this tool exercises.
+
+### Build tooling (unchanged from the 2026-09-01 ELF-linking work
+### previously staged as Unreleased and now folded into this release)
+
+- **ELF-linking phase.** `tools/build.sh` now links `build-out/*.o`
+  (this repo's own `src/*.pdx` objects) into
+  `build-out/umount.pdxfs.elf` via `ld -T link.ld`, plus a matching
+  `.bin` via `objcopy`, for paideia-os issue #1976/#1977 (satellite-
+  tool boot-time `/bin` seeding pipeline). New `link.ld` at repo root
+  -- the same `true.ld`-derived layout (`.text`/`.rodata` at
+  `0x00400000`, `.data`/`.bss` at `0x00600000`, `.bss` kept contiguous
+  with `.data` per paideia-os#1595) every other satellite tool uses.
+  `tools/build.sh` also gains a repeatable `--extra-obj-dir DIR` flag
+  so a caller (e.g. paideia-os's own build, or a sibling satellite
+  repo) can fold in dependency object files at link time; a missing
+  or empty directory contributes nothing and is not an error. The
+  `tests/*.pdx` objects are never linked.
+
+### Encoder-gap discipline
+
+- No `@no_frame`. No `// No @no_frame` markers. Every new comment
+  block uses `// Frame prologue implicit` phrasing where a per-fn
+  frame note is warranted; this release adds no new functions and
+  extends no existing function bodies, so no such marker is needed.
+- No new `add reg, [mem]`. No new `test` mnemonics. Every immediate
+  in operand position remains a numeric literal (see LV.M1-005 note
+  above); every symbolic constant lives in comments or in a
+  library-side `pub let X : u64 = <literal>` binding.
+
+### Not touched at this release
+
+- `caps.decl` (unchanged -- no cap-kind or op catalog change).
+- `design/architecture.md` (unchanged -- adoption is a source-comment
+  swap, not an architectural move).
+- `doc/umount.pdxfs.pdxdoc` (unchanged -- no public-surface change
+  visible to `doc umount.pdxfs`).
+- `release/RELEASE-1.0.0.md` (kept as the R53 wave-close record;
+  cutting a new `RELEASE-1.1.0.md` is out of scope for an adoption-
+  only bump and follows main-only precedent whenever the v1.1.0 tag
+  is cut).
+- Every `tests/test_*.pdx` M4 smoke driver (unchanged -- no wire
+  shape moved, so each M4 driver's oracle continues to hold).
 
 ## 1.0.0 — 2026-08-31 (R53 wave close, M5-001)
 

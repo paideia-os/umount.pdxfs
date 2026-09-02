@@ -13,7 +13,7 @@
 # accept the syntax used in this repo.
 #
 # Usage:
-#   tools/build.sh [--extra-obj-dir DIR]...
+#   tools/build.sh [--extra-obj-dir DIR]... [--extra-archive PATH]...
 #
 # --extra-obj-dir DIR may be repeated. Every *.o file found directly inside
 # each DIR is added to the `ld` link line alongside this repo's own
@@ -21,15 +21,31 @@
 # does not exist, or that contains no .o files, contributes nothing and is
 # NOT an error.
 #
+# --extra-archive PATH may be repeated. Each PATH is a static archive
+# (`.a`) appended to the final `ld` link line AFTER the --extra-obj-dir
+# objects (paideia-os#2226, satellite-runtime-shim design §4.1/§5).
+# Archives on the link line are pulled in AS-NEEDED (unlike loose
+# objects, which link unconditionally); `--gc-sections` then prunes the
+# unused Rust symbols from the Phase A/B satellite-runtime + audit-
+# satellite archives so they never reach the output ELF. Standard
+# invocation:
+#
+#   bash tools/build.sh \
+#     --extra-obj-dir ../libpdx-volume/build-out \
+#     --extra-archive .../libpaideia_satellite_runtime.a \
+#     --extra-archive .../libpdx-audit-satellite.a
+#
 # Linking phase: once every src/*.pdx compiles cleanly, this repo's own
 # object files (build-out/*.o from src/*.pdx -- never the build-out/tests-
-# *.o unit-test scaffolding) plus any --extra-obj-dir objects are linked
-# via `ld -T link.ld` into build-out/umount.pdxfs.elf, then objcopy'd to
+# *.o unit-test scaffolding) plus any --extra-obj-dir objects and any
+# --extra-archive archives are linked via `ld -T link.ld --gc-sections`
+# into build-out/umount.pdxfs.elf, then objcopy'd to
 # build-out/umount.pdxfs.bin.
 
 set -euo pipefail
 
 EXTRA_OBJECTS=()
+EXTRA_ARCHIVES=()
 OWN_OBJECTS=()
 EXTRA_OBJ_DIRS=()
 
@@ -41,6 +57,14 @@ while [ "$#" -gt 0 ]; do
                 exit 2
             fi
             EXTRA_OBJ_DIRS+=("$2")
+            shift 2
+            ;;
+        --extra-archive)
+            if [ "$#" -lt 2 ]; then
+                echo "[build] FAIL: --extra-archive requires an argument" >&2
+                exit 2
+            fi
+            EXTRA_ARCHIVES+=("$2")
             shift 2
             ;;
         *)
@@ -130,13 +154,14 @@ for dir in "${EXTRA_OBJ_DIRS[@]}"; do
 done
 shopt -u nullglob
 
-# ---- Link phase: OWN_OBJECTS + EXTRA_OBJECTS -> build-out/umount.pdxfs.elf.
+# ---- Link phase: OWN_OBJECTS + EXTRA_OBJECTS + EXTRA_ARCHIVES ->
+# ---- build-out/umount.pdxfs.elf.
 if [ "$FAIL" -eq 0 ] && [ "${#OWN_OBJECTS[@]}" -gt 0 ]; then
     echo "[link] ld -T link.ld -> $BUILD_DIR/umount.pdxfs.elf"
-    ld -nostdlib --warn-common --fatal-warnings \
+    ld -nostdlib --warn-common --fatal-warnings --gc-sections \
         -T link.ld \
         -o "$BUILD_DIR/umount.pdxfs.elf" \
-        "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}"
+        "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}" "${EXTRA_ARCHIVES[@]}"
     echo "[link] OK -> $BUILD_DIR/umount.pdxfs.elf"
 
     objcopy -O binary "$BUILD_DIR/umount.pdxfs.elf" "$BUILD_DIR/umount.pdxfs.bin"
