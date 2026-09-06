@@ -1,182 +1,74 @@
 # umount.pdxfs — caps.decl
 #
-# Wave: R53 (design/tooling/volume-tooling-ux.md §2.3 + §5 + §9.3, paideia-os
-# repo). umount.pdxfs is a standalone CLI tool (a ring-3 ELF with its own
-# `_start`, not a shared library like libpdx-volume/libpdx-audit): it
-# performs its own syscalls directly (self-contained inlined-syscall
-# pattern, matching src/user/true.pdx / cat.pdx / mkdir.pdx in the
-# paideia-os monorepo, and mkfs.pdxfs's own M1 landing in this same repo
-# family) rather than delegating every kernel touch to a linked library.
+# Format: R90-XREPO.013.M1-001 line-oriented caps.decl grammar
+# (paideia-os design/architecture/caps-decl-format.md). Replaces this
+# repo's prior R53-vintage prose caps.decl (consumed_kinds narrative
+# style) per the R90-XREPO.013.M4-001 adoption wave
+# (paideia-os design/user/fs-tools-caps.md §2.3, paideia-os#2131).
 #
-# consumed_kinds (kernel-owned; paideia-os repo):
+# umount.pdxfs is a standalone CLI tool (a ring-3 ELF with its own
+# `_start`), not a shared library: it performs its own syscalls
+# directly rather than delegating every kernel touch to a linked
+# library. See src/target_resolve.pdx, src/handle_check.pdx,
+# src/unmount_op.pdx, src/unmount_record.pdx for the call sites each
+# declared kind below backs.
+
+!KIND_USER                0x001   # invoker attribution (audit; unmount_record.pdx)
+!KIND_PDXFS_MOUNT_TABLE   0x006   # READ_ROW + LIST (target_resolve.pdx mount-table walk; row-remove op still unlanded)
+ KIND_VOLUME              0x00F   # flush+unmount (rights band, ops TBD; unmount_op.pdx steps 2-4)
+ KIND_IPC_ENDPOINT        0x001   # semantic-pipe stdout (pipe_wire.pdx; svc.schema-registry not yet live, deferred)
+
+# Notes:
 #
-#   KIND_USER              = 0x190  (src/kernel/core/cap/kind_user.pdx)
-#     -- invoker identity, consumed for audit attribution
-#        (`invoker_user` field of PdxFsUnmountRecord@0.1, §5.6). Not
-#        dereferenced by any M1 code path -- M1's --dry-run record is
-#        the task-scoped 3-field slice (target, flags, result_code);
-#        it never performs a KIND_USER lookup. Real invoker_user
-#        population lands at umount.pdxfs.M3-003 (semantic-pipe emit
-#        of the full 15-field record) alongside audit-journal
-#        attribution.
+# - KIND_USER and KIND_PDXFS_MOUNT_TABLE are mandatory: umount must
+#   attribute audit (KIND_USER) and must be able to walk the mount
+#   table to resolve a `<mount-id | mount-point>` positional to a
+#   mount_id (KIND_PDXFS_MOUNT_TABLE, target_resolve.pdx). A parent
+#   holding less than the declared rights on either fails the
+#   exec-time reconcile with -EACCES per the mandatory-narrower-than-
+#   decl rule (format spec §4/§5) rather than let this tool do partial
+#   work. The mount-table op catalog (`PMT_OP_MAX` = 3: LIST/READ_ROW/
+#   APPEND_ROW/QUERY_SLOT_COUNT) still has no REMOVE_ROW ordinal —
+#   src/unmount_op.pdx's own row-removal step (§5.5 step 5) is a
+#   documented stub (`UO_STUB_ROW_REMOVE`) — the decl reserves the
+#   rights band (0x006) so the eventual op lands without a decl
+#   amendment.
 #
-#   KIND_PDXFS_MOUNT_TABLE(read+write) = 0x1A5  (R53-PREP-001,
-#     src/kernel/core/cap/kind_pdxfs_mount_table.pdx)
-#     -- read authority to resolve a `<mount-point>` positional to a
-#        mount_id via libpdx-volume.mount_table_snapshot (§5.1,
-#        umount.pdxfs.M2-001); write authority to remove the row once
-#        the unmount completes (§5.5 step 5, umount.pdxfs.M2-003). Not
-#        invoked by any M1 code path -- M1's --dry-run branch never
-#        calls PMT_OP_READ_ROW / PMT_OP_LIST / PMT_OP_APPEND_ROW (the
-#        kind's own landed op catalog, per
-#        src/kernel/core/cap/kind_pdxfs_mount_table.pdx SECTION 6); it
-#        only inspects the raw `<mount-id | mount-point>` argv string
-#        to render the dry-run line. Real mount-point -> mount_id
-#        resolution is umount.pdxfs.M2-001.
+# - KIND_VOLUME is optional: a `--dry-run` umount (target resolution
+#   only) never opens the volume; the real flush+unmount path
+#   (unmount_op.pdx's six-step pipeline, steps 2-4) does. The narrow
+#   keeps this cap out of dry-run child processes. The rights band
+#   (0x00F) mirrors this repo's own R53 prose decl's "flush+unmount"
+#   label; the KIND's REAL landed op catalog is VOL_OP_QUERY_* +
+#   VOL_OP_DEBUG_PRINT only (ordinals 0..9) — there is still no landed
+#   "unmount" op, so this reserves the band ahead of the op existing,
+#   same posture as mount.pdxfs's own KIND_VOLUME entry.
 #
-#   KIND_VOLUME(flush+unmount, <resolved-cap>) = 0x1A0  (R52,
-#     src/kernel/core/cap/kind_volume.pdx)
-#     -- resolved by looking up the mount-table row (§5.2), not held
-#        ambiently at process start. "flush+unmount" is this design
-#        doc's own §5.2 rights label; the KIND's REAL landed op
-#        catalog (per libpdx-volume's own caps.decl in
-#        paideia-satellites/libpdx-volume) is VOL_OP_QUERY_* +
-#        VOL_OP_DEBUG_PRINT (ordinals 0..9, VK_OPS_VALID_MASK = 0x3FF)
-#        -- there is no landed "unmount" op yet, and §5.3's
-#        `VOL_OP_QUERY_HANDLE_COUNT` is itself flagged in
-#        volume-tooling-ux.md §5.3 as "a new op added by R53.M2",
-#        i.e. not yet landed kernel-side as of this M1 caps.decl. This
-#        mirrors the same "design-doc rights label vs. real landed op
-#        catalog" gap mkfs.pdxfs's own caps.decl flags for
-#        KIND_BLOCK_DEVICE -- confirm the op numbering with osarch
-#        before umount.pdxfs.M2-002 (handle-count query) and M2-003
-#        (cache-flush + checkpoint path) implement a real cap-invoke
-#        against either op. Not invoked by any M1 code path.
+# - KIND_ELEVATE_CHANNEL is deliberately ABSENT from this decl.
+#   `--force` triggers an on-demand elevate-broker request
+#   (src/elevate.pdx) per §5.2/§8.2 of design/tooling/volume-tooling-
+#   ux.md (paideia-os repo) and R90-XREPO.011 policy — the elevate cap
+#   is never held ambiently at exec time, matching the `rm`/
+#   mount.pdxfs pattern the round plan pins. (src/elevate.pdx's
+#   `Elevate::elevate_request_force_unmount` remains a fail-closed
+#   stub predating this decl format — that binding gap is tracked
+#   separately and does not change this exec-time declaration.)
 #
-#   KIND_ELEVATE_CHANNEL   = 0x191  (R48b, src/kernel/core/cap/
-#     kind_elevate_channel.pdx, derived over KIND_IPC_ENDPOINT base 5)
-#     -- referenced by volume-tooling-ux.md §5.2 + §8.2 for the
-#        `--force` elevate gate (only for mount points under
-#        `/system`, `/boot`, `/dev` -- mirrors mount.pdxfs's own §4.2
-#        table). Not declared as an actively consumed kind at M1: no
-#        code path in this landing calls libpdx-elevate, which itself
-#        has not been located under paideia-satellites/ as of this
-#        landing (same "design-doc-mentioned, not yet bootstrapped"
-#        status mkfs.pdxfs's own caps.decl documents) -- see
-#        src/elevate.pdx's module header in this repo and
-#        design/architecture.md §3 for the deferral note.
+# - KIND_IPC_ENDPOINT is optional: the semantic-pipe stdout binding
+#   (src/pipe_wire.pdx) is a real call site but presently inert
+#   (svc.schema-registry does not exist yet, see paideia-os#2000), so
+#   the line-based sys_write(1, ...) rendering runs with or without
+#   this cap. Reserving the decl entry now keeps the eventual real
+#   bind a rights-narrow, not a decl amendment.
 #
-# declares_output_schemas: none bound at M1. `PdxFsUnmountRecord@0.1`'s
-# FIELD SHAPE is fixed by design/tooling/volume-tooling-ux.md §5.6 (15
-# fields: audit_id, mount_id, volume_uuid, mount_point, invoker_user,
-# dirty_pages_flushed, txns_drained, journal_state, result_code,
-# open_handles, revoked_handles, deferred, ts_ns). This M1 landing's
-# --dry-run path prints a line-based textual rendering of exactly the
-# three fields this issue's own acceptance shape asks for (target,
-# flags, result_code) -- see src/unmount_record.pdx's module header for
-# which fields M1 omits and why. The typed schema-registry binding
-# (BLAKE3-truncated fingerprint constant, semantic-pipe framing) is
-# owned by umount.pdxfs.M3-003 per volume-tooling-ux.md §7.3 + §7.4, not
-# this issue.
+# - This decl is already a signed input in release/manifest.pdxsig.txt
+#   [artifacts.source] (`caps.decl blake3-256 = <BLAKE3-caps.decl>`);
+#   tampering with a shipped decl fails signature verification before
+#   exec ever reaches the reconciler. No manifest change was needed
+#   for this adoption pass.
 #
-# M1 landing status (see STATUS.md): this repo performs exactly two
-# syscalls at M1 -- `sys_write` (SC+ ID 1, to fd 1 for the dry-run
-# record and fd 2 for error diagnostics) and `sys_exit` (SC+ ID 60). No
-# sys_open, no sys_svc_lookup, no sys_ipc_send, no cap-invoke of any
-# kind -- every KIND above is declared for the SHAPE this tool's future
-# milestones consume, per the same "typed-against, not yet touched"
-# posture mkfs.pdxfs's own M1 caps.decl documents for its stub
-# functions.
-#
-# M2 landing status (see STATUS.md; issues #4/#5/#6): STILL no cap-invoke
-# of any kind, and none of the three KIND gaps this file already flagged
-# above have closed. Specifics, confirmed by direct kernel/library grep
-# during M2:
-#
-#   - `KIND_PDXFS_MOUNT_TABLE`: no ambient cap-slot convention exists
-#     anywhere (design doc or this repo's own argv surface) for THIS
-#     tool to obtain a live singleton row, so `src/target_resolve.pdx`'s
-#     mount-point-path branch calls `libpdx-volume.mount_table_snapshot`
-#     against a deliberately all-zero local row (real call, real link
-#     edge, safe-by-construction failure -- see that file's own module
-#     header). `PMT_OP_MAX` = 3 (LIST/READ_ROW/APPEND_ROW/QUERY_SLOT_
-#     COUNT) also has no remove-row op, so `src/unmount_op.pdx`'s row-
-#     removal step (§5.5 step 5) is a documented stub (UO_STUB_ROW_
-#     REMOVE).
-#   - `KIND_VOLUME`: `VOL_OP_QUERY_HANDLE_COUNT` still has not landed
-#     (`kind_volume.pdx`'s `VOL_OP_MAX` is still 9, ops 0..9 only, no new
-#     ordinal). A SECOND, independently-blocking gap surfaced at M2: the
-#     real `_mount_table[]` per-slot layout carries no cap-slot field at
-#     all, so there is no way to derive WHICH `KIND_VOLUME` cap a
-#     resolved `mount_id` corresponds to even if the op existed.
-#     `src/handle_check.pdx`'s handle-count query is therefore a hard
-#     stub (always reports 0 handles); the IN_USE refusal LOGIC is real
-#     and live, just structurally unreachable until both gaps close.
-#   - `sys_umount` (sysno 76): the kernel BODY landed
-#     (`src/kernel/core/syscall/sys_umount.pdx`, R53.M2-003 #1738) but
-#     `dispatch.pdx`'s `dispatch_umount` label was never rewired off its
-#     original R53.M2-001 (#1736) `-ENOSYS` stub -- confirmed by direct
-#     read of dispatch.pdx as of this M2 landing. `src/unmount_op.pdx`
-#     issues the real syscall anyway and treats the deterministic
-#     `-ENOSYS` as a documented stub condition (bit 0 of its stub_mask),
-#     not a hard failure, per this milestone's own "the overall happy
-#     path should still complete and emit OK" instruction. **Flagged for
-#     main**: this is a one-block dispatch.pdx rewrite (mirror
-#     `dispatch_open`'s KPTI-bounce shape), not a design gap.
-#
-# M3 landing status (see STATUS.md; issues #7/#8/#9/#10): three new
-# satellite-library links, no new syscalls of this repo's own, none of
-# the three M2 kernel/library gaps above have closed.
-#
-# consumed_satellite_libs (all cross-repo bare-label `call`s, the same
-# mechanism `src/target_resolve.pdx`'s M2 `mount_table_snapshot` call
-# already used):
-#
-#   libpdx-volume (M3-004, #10) -- `pdxb_sign_superblock`
-#     (`src/unmount_op.pdx`'s step 4). REAL call, against a deliberately
-#     PLACEHOLDER 4096-byte `.bss` scratch buffer (not the genuine
-#     on-disk superblock -- this tool still has no block-device read
-#     primitive) and a real, non-null, all-zero 32-byte seed buffer
-#     (not a real seed -- same "seed is zero, not unavailable" posture
-#     mkfs.pdxfs's own M3-004 landing documents for the identical
-#     intrinsic). The SIG_KEY_LOCKED refusal gate this call feeds is
-#     real and live but unreachable: the `MlDsa65::sign` intrinsic only
-#     fails on a NULL `seed_ptr`, and this buffer is never null.
-#
-#   libpdx-audit (@0.2, commit bfc63a5, landed dependency) --
-#     `AuditClient::audit_begin`, `AuditClient::audit_record_output`,
-#     `AuditClient::audit_commit` (`src/audit_wire.pdx`, #9). REAL calls
-#     (real IPC send attempts), but the daemon-side dispatch is the same
-#     confirmed-STUBBED `audit_journal_broker_dispatch` mkfs.pdxfs's own
-#     M3-004 landing documents -- every call here may therefore no-op at
-#     the daemon, per the same forgiving-posture instruction that
-#     landing established. `audit_record_output` is called exactly once
-#     per invocation, only on the `--lazy` DEFERRED arm (the "DEFERRED"
-#     mid-lifecycle audit emission #9 asks for).
-#
-#   libpdx-elevate (4844 LOC, mature -- landed dependency) -- NOT
-#     actually called for a real elevation decision
-#     (`src/elevate.pdx`, #8): this library's real API
-#     (`elevate_client_acquire`/`elevate_client_require`) needs a
-#     `parent_ep_slot` broker-endpoint cap this repo does not hold
-#     (`KIND_ELEVATE_CHANNEL = 0x191`, still the M1 placeholder,
-#     unchanged by this landing). `elevate_request_force_unmount` is
-#     therefore a fail-closed stub returning DENY unconditionally --
-#     the identical gap and posture mkfs.pdxfs's own M3-005
-#     `elevate_wire.pdx` documents over the same library.
-#
-#   libpdx-semantic-pipe (v1.0.0, real + released) -- NOT linked
-#     (`src/pipe_wire.pdx`, #9): confirmed via GitHub issue
-#     paideia-os#2000 that `Registry::bind_by_name` is inert (the
-#     backing `svc.schema-registry` service does not exist yet). Per
-#     mkfs.pdxfs's own M3-003 fallback precedent, every
-#     `PdxFsUnmountRecord@0.1` this repo emits remains the M1/M2
-#     line-based `sys_write(1, ...)` rendering, now preceded by one
-#     documented deferral header line.
-#
-# New (real, live) refusal/stub result codes added at M3 (see
-# `src/unmount_op.pdx` / `src/unmount_record.pdx` for the full bit/code
-# tables): `UO_RC_DEFERRED`/`UR_RC_DEFERRED` (4, --lazy, stubbed
-# completion), `UO_RC_ELEVATION_STUB`/`UR_RC_ELEVATION_STUB` (5,
-# --force, fail-closed), `UO_RC_SIG_KEY_LOCKED`/`UR_RC_SIG_KEY_LOCKED`
-# (6, superblock re-sign refusal, real gate, unreachable).
+# References:
+#   paideia-os design/architecture/caps-decl-format.md — format spec (R90-XREPO.013.M1-001)
+#   paideia-os design/user/fs-tools-caps.md §2.3        — declared cap-set for this tool
+#   paideia-os src/kernel/core/cap/reconcile.pdx        — kernel substrate
+#   paideia-os#2131                                     — fs-tools adoption inventory
