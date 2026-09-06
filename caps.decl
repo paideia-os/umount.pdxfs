@@ -54,6 +54,17 @@
 #   stub predating this decl format — that binding gap is tracked
 #   separately and does not change this exec-time declaration.)
 #
+#   LE-001 (#22) adds a SECOND on-demand elevate case, conditional on
+#   the unmount TARGET rather than on `--force`: any unmount whose raw
+#   argv string classifies as `/system` (target_resolve.pdx's
+#   `target_is_system`) requests elevation via `Elevate::elevate_
+#   request_system_unmount` (src/elevate.pdx) BEFORE the mount-table
+#   mutation, regardless of --force/--lazy/handle_count. Same posture
+#   as the --force case above: on-demand only, never ambient, still a
+#   fail-closed stub (no broker-endpoint cap provisioned to this tool)
+#   — this decl entry does not change. A non-/system unmount (the
+#   common case) never reaches this code path at all.
+#
 # - KIND_IPC_ENDPOINT is optional: the semantic-pipe stdout binding
 #   (src/pipe_wire.pdx) is a real call site but presently inert
 #   (svc.schema-registry does not exist yet, see paideia-os#2000), so

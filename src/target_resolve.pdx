@@ -241,4 +241,113 @@ module TargetResolve = structure {
         ret;
       }
     }
+
+  // ==========================================================================
+  // umount.pdxfs.LE-001 (#22) — /system unmount-target classification
+  // ==========================================================================
+  //
+  // `elevate.pdx`'s own new `elevate_request_system_unmount` gate needs
+  // a predicate answering "is this unmount's target /system" BEFORE any
+  // mount-table mutation is attempted. The predicate is evaluated over
+  // the CALLER-SUPPLIED RAW `target_ptr` string itself (main.pdx's
+  // `ParsedArgv.target_ptr`, the exact same string `target_resolve`
+  // above classifies as numeric-vs-path in its first three instructions)
+  // -- NOT over any resolved mount-table row. This is a real, load-
+  // bearing scope limit, not an oversight: a `<mount-id>`-shaped target
+  // (a decimal digit string, e.g. "3") can never be told apart from a
+  // `/home/**` mount by this predicate, because there is no landed
+  // mount_id -> path reverse lookup anywhere this ring-3 tool can reach
+  // (the identical dead end this file's own module header §2 already
+  // documents for the FORWARD path -> mount_id direction — the real
+  // `_mount_table[]` per-slot layout `libpdx-volume.mount_table_
+  // snapshot` decodes has no path-comparable field at all). A caller
+  // unmounting a `/system` volume BY NUMERIC MOUNT ID therefore bypasses
+  // this gate today. **Flagged for main**: closing this gap needs the
+  // same richer per-mount record (or a path-resolving kernel primitive)
+  // §2 already flags as missing.
+  //
+  // Matching convention: an 8-byte `"/system/"` prefix literal,
+  // byte-for-byte the same literal (and the same trailing-slash
+  // requirement — a bare `"/system"` argument, with no trailing path
+  // component, does NOT match) mount.pdxfs's own `Elevate::elev_lit_
+  // system` uses for its analogous mount-point-class table (design/
+  // tooling/volume-tooling-ux.md §4.2). Keeping the two literals
+  // byte-identical (rather than, say, a 7-byte no-slash prefix) means
+  // both tools draw the /system line in exactly the same place.
+  //
+  // Encoder-gap discipline: no `add reg,[mem]`. No `test` mnemonic. New
+  // labels in this addendum are prefixed `umnt_tr_pm_`.
+  //
+  // Upstream: design/tooling/volume-tooling-ux.md §4.2, §5.2, §8.2
+  // (paideia-os); paideia-os/umount.pdxfs#22 (LE-001); mount.pdxfs's own
+  // src/elevate.pdx (`mount_elev_prefix_match` / `elev_lit_system` — the
+  // sibling-repo precedent this addendum's literal and loop shape
+  // mirror exactly).
+
+  // --- /system prefix literal (byte-identical to mount.pdxfs's own
+  //     elev_lit_system). -------------------------------------------------
+  pub let umnt_tr_lit_system : [u8; 9] = "/system/\0"
+  pub let UMNT_TR_LEN_SYSTEM : u64 = 8
+
+  // ==========================================================================
+  // umnt_tr_prefix_match(str_ptr, lit_ptr, lit_len) -> u64
+  //     (1 = str_ptr's first lit_len bytes equal lit_ptr's; 0 = not)
+  //
+  // umount.pdxfs.LE-001 (#22): byte-loop prefix compare, identical shape
+  // to mount.pdxfs's own Elevate::mount_elev_prefix_match. Pure leaf:
+  // rax/rcx/rdi/rsi/rdx/r8 all SysV caller-save, no push/pop, no nested
+  // call.
+  // ==========================================================================
+  pub let umnt_tr_prefix_match : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) (lit_ptr: u64) (lit_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.LE-001 (#22): umnt_tr_prefix_match entry point. rdi=str_ptr, rsi=lit_ptr, rdx=lit_len. `xor r8,r8` (index). Loop: `cmp r8,rdx; jge umnt_tr_pm_yes` (all lit_len bytes matched so far, including the len==0 degenerate case which matches trivially); xor+mov_b loads str_ptr[r8] into rax and lit_ptr[r8] into rcx (zero-extended per paideia-as #1248 workaround); `cmp rax,rcx; jne umnt_tr_pm_no` on mismatch; else `add r8,1; jmp` the loop head. umnt_tr_pm_yes: `mov rax,1; ret`. umnt_tr_pm_no: `xor rax,rax; ret`. Pure leaf -- no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed umnt_tr_pm_.",
+      block: {
+        xor r8, r8;                          // r8 = index
+
+      umnt_tr_pm_loop:
+        cmp r8, rdx;
+        jge umnt_tr_pm_yes;
+
+        xor rax, rax;
+        mov_b rax, [rdi + r8];
+        xor rcx, rcx;
+        mov_b rcx, [rsi + r8];
+        cmp rax, rcx;
+        jne umnt_tr_pm_no;
+
+        add r8, 1;
+        jmp umnt_tr_pm_loop;
+
+      umnt_tr_pm_yes:
+        mov rax, 1;
+        ret;
+
+      umnt_tr_pm_no:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // target_is_system(target_ptr) -> u64
+  //     (1 = target_ptr's raw string starts with "/system/"; 0 = otherwise)
+  //
+  // umount.pdxfs.LE-001 (#22): the /system predicate this file's own
+  // module header (this addendum) documents above. A tail delegation to
+  // umnt_tr_prefix_match against umnt_tr_lit_system/UMNT_TR_LEN_SYSTEM --
+  // no push/pop needed, rdi (target_ptr) is already in the position the
+  // callee expects.
+  // ==========================================================================
+  pub let target_is_system : (u64) -> u64 !{mem} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.LE-001 (#22): target_is_system entry point. rdi=target_ptr, left untouched (the callee below reads it as its own first argument). lea rsi,[rip+umnt_tr_lit_system]; mov rdx,8 (UMNT_TR_LEN_SYSTEM); call umnt_tr_prefix_match -- tail-returns its rax verbatim (1 = /system/ prefix match, 0 = not). No push/pop needed (nothing here survives past the call). No `add reg,[mem]`, no `test`. No new labels (no branch beyond the tail call).",
+      block: {
+        lea rsi, [rip + umnt_tr_lit_system];
+        mov rdx, 8;                          // UMNT_TR_LEN_SYSTEM
+        call umnt_tr_prefix_match;           // rdi already = target_ptr
+        ret;
+      }
+    }
 }

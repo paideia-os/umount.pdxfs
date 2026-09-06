@@ -101,6 +101,12 @@ module UnmountRecord = structure {
   //     -- see src/elevate.pdx), SIG_KEY_LOCKED (superblock re-sign
   //     refusal, real gate but unreachable at this landing -- see
   //     src/unmount_op.pdx's own module header for why). ------------
+  // --- umount.pdxfs.LE-001 (#22) addition: SYSTEM_UNMOUNT_REFUSED --
+  //     the /system elevate-gate refusal, a DISTINCT code path from
+  //     ELEVATION_STUB above (gated in main.pdx BEFORE handle_check_
+  //     refuse/unmount_op are ever reached, independent of --force /
+  //     handle_count -- see src/elevate.pdx's elevate_request_system_
+  //     unmount and src/target_resolve.pdx's target_is_system). -------
   pub let UR_RC_OK               : u64 = 0
   pub let UR_RC_IN_USE           : u64 = 1
   pub let UR_RC_KERNEL_ERROR     : u64 = 2
@@ -112,6 +118,13 @@ module UnmountRecord = structure {
   pub let UR_RC_DEFERRED         : u64 = 4   // M3-001 (#7) -- --lazy stub
   pub let UR_RC_ELEVATION_STUB   : u64 = 5   // M3-002 (#8) -- --force fail-closed
   pub let UR_RC_SIG_KEY_LOCKED   : u64 = 6   // M3-004 (#10) -- unreachable, see unmount_op.pdx
+  // --- LE-001 (#22) addition: the /system elevate-gate refusal (src/
+  //     elevate.pdx's elevate_request_system_unmount, gated in main.pdx
+  //     BEFORE handle_check_refuse/unmount_op are ever called -- a
+  //     DISTINCT code path and DISTINCT result_code from UR_RC_
+  //     ELEVATION_STUB above, which is --force-specific and only
+  //     reachable from inside unmount_op's own handle_count>0 branch).
+  pub let UR_RC_SYSTEM_UNMOUNT_REFUSED : u64 = 7
 
   pub let ur_lit_mount_id     : [u8; 13] = ", mount_id: \0"
   pub let ur_lit_result_code  : [u8; 16] = ", result_code: \0"
@@ -126,6 +139,7 @@ module UnmountRecord = structure {
   pub let ur_lit_rc_deferred         : [u8; 9]  = "DEFERRED\0"
   pub let ur_lit_rc_elevation_stub   : [u8; 15] = "ELEVATION_STUB\0"
   pub let ur_lit_rc_sig_key_locked   : [u8; 15] = "SIG_KEY_LOCKED\0"
+  pub let ur_lit_rc_system_unmount_refused : [u8; 23] = "SYSTEM_UNMOUNT_REFUSED\0"
 
   // ==========================================================================
   // unmount_record_strlen(s) -> u64
@@ -434,7 +448,7 @@ module UnmountRecord = structure {
   pub let unmount_record_emit_result : (u64, u64, u64, u64, u64) -> () !{mem, sysreg} @{fs} =
     fn (target_ptr: u64) (mount_id: u64) (result_code: u64) (handle_count: u64) (stub_mask: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "umount.pdxfs.M2-003 (#6) + M3 (#7/#8/#10): unmount_record_emit_result entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any, pops all five (reverse order) at the single shared epilogue before `ret`. rbx=target_ptr, r12=mount_id, r13=result_code, r14=handle_count, r15=stub_mask -- all now-saved callee-save regs surviving every nested `call`/`syscall` below. Eleven segments in wire order, each a literal-then-optionally-dynamic sys_write pair (or a single dynamic call for the four decimal segments): (1) ur_lit_prefix 'PdxFsUnmountRecord@0.1 { target: ' (33B). (2) target string via unmount_record_strlen(rbx) -> rdx=len, sys_write(1,rbx,rdx). (3) ur_lit_mount_id ', mount_id: ' (12B). (4) `call unmount_record_write_u64_dec` with rdi=1,rsi=r12 (mount_id). (5) ur_lit_result_code ', result_code: ' (15B). (6) result_code word selection: cmp r13 against 0/1/2/4/5/6 in turn (umnt_ur_res_ok/_in_use/_kernel_error/_deferred/_elevation_stub/_sig_key_locked -- the M3 arms (#7/#8/#10) added after the M2 three), each setting rsi/rdx to its literal+len and jumping to umnt_ur_res_emit; any other value (including the canonical 3 = UR_RC_MOUNT_NOT_FOUND) falls through to the MOUNT_NOT_FOUND literal before umnt_ur_res_emit issues the one shared sys_write(1,rsi,rdx). (7) ur_lit_handle_count ', handle_count: ' (16B). (8) `call unmount_record_write_u64_dec` with rdi=1,rsi=r14 (handle_count). (9) ur_lit_stub_mask ', stub_mask: ' (13B). (10) `call unmount_record_write_u64_dec` with rdi=1,rsi=r15 (stub_mask). (11) ur_lit_result_suffix ' }\\n' (3B). Every literal-only segment reloads rdi=1/rax=1 fresh before its own `syscall` rather than assuming any caller-save register survives a prior syscall (matches unmount_record_emit_dry_run's own documented rationale: the kernel's #743 hardening zeroes rdi/rsi/rdx/r8/r9/r10 on every sysret). No `add reg,[mem]` anywhere. No `test` mnemonic. Labels prefixed umnt_ur_res_.",
+      justification: "umount.pdxfs.M2-003 (#6) + M3 (#7/#8/#10) + LE-001 (#22): unmount_record_emit_result entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any, pops all five (reverse order) at the single shared epilogue before `ret`. rbx=target_ptr, r12=mount_id, r13=result_code, r14=handle_count, r15=stub_mask -- all now-saved callee-save regs surviving every nested `call`/`syscall` below. Eleven segments in wire order, each a literal-then-optionally-dynamic sys_write pair (or a single dynamic call for the four decimal segments): (1) ur_lit_prefix 'PdxFsUnmountRecord@0.1 { target: ' (33B). (2) target string via unmount_record_strlen(rbx) -> rdx=len, sys_write(1,rbx,rdx). (3) ur_lit_mount_id ', mount_id: ' (12B). (4) `call unmount_record_write_u64_dec` with rdi=1,rsi=r12 (mount_id). (5) ur_lit_result_code ', result_code: ' (15B). (6) result_code word selection: cmp r13 against 0/1/2/4/5/6/7 in turn (umnt_ur_res_ok/_in_use/_kernel_error/_deferred/_elevation_stub/_sig_key_locked/_system_unmount_refused -- the M3 arms (#7/#8/#10) plus the LE-001 (#22) seventh arm added after the M2 three), each setting rsi/rdx to its literal+len and jumping to umnt_ur_res_emit; any other value (including the canonical 3 = UR_RC_MOUNT_NOT_FOUND) falls through to the MOUNT_NOT_FOUND literal before umnt_ur_res_emit issues the one shared sys_write(1,rsi,rdx). (7) ur_lit_handle_count ', handle_count: ' (16B). (8) `call unmount_record_write_u64_dec` with rdi=1,rsi=r14 (handle_count). (9) ur_lit_stub_mask ', stub_mask: ' (13B). (10) `call unmount_record_write_u64_dec` with rdi=1,rsi=r15 (stub_mask). (11) ur_lit_result_suffix ' }\\n' (3B). Every literal-only segment reloads rdi=1/rax=1 fresh before its own `syscall` rather than assuming any caller-save register survives a prior syscall (matches unmount_record_emit_dry_run's own documented rationale: the kernel's #743 hardening zeroes rdi/rsi/rdx/r8/r9/r10 on every sysret). No `add reg,[mem]` anywhere. No `test` mnemonic. Labels prefixed umnt_ur_res_.",
       block: {
         push rbx;
         push r12;
@@ -496,6 +510,8 @@ module UnmountRecord = structure {
         je umnt_ur_res_elevation_stub;
         cmp r13, 6;
         je umnt_ur_res_sig_key_locked;
+        cmp r13, 7;
+        je umnt_ur_res_system_unmount_refused;
 
         lea rsi, [rip + ur_lit_rc_mount_not_found];
         mov rdx, 15;
@@ -529,6 +545,11 @@ module UnmountRecord = structure {
       umnt_ur_res_sig_key_locked:
         lea rsi, [rip + ur_lit_rc_sig_key_locked];
         mov rdx, 14;
+        jmp umnt_ur_res_emit;
+
+      umnt_ur_res_system_unmount_refused:
+        lea rsi, [rip + ur_lit_rc_system_unmount_refused];
+        mov rdx, 22;
 
       umnt_ur_res_emit:
         mov rdi, 1;

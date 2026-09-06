@@ -211,6 +211,21 @@ its own landed body.
       runbook (mirror endpoint does not exist as of R53 close, per
       the sibling libraries' own M5 findings).
 
+## Post-M5 follow-up
+
+- [x] **LE-001** (#22) — `/system` elevate gate. `src/target_resolve.
+      pdx`'s new `target_is_system` classifies the raw argv target
+      string; `src/elevate.pdx`'s new `elevate_request_system_unmount`
+      is a SECOND, independent fail-closed elevate stub (distinct from
+      M3-002's `--force` gate — this one fires on target classification
+      alone, before `handle_check_refuse`/`unmount_op` ever run, so a
+      `/system` unmount refuses (`UR_RC_SYSTEM_UNMOUNT_REFUSED`, exit 9)
+      with the mount left live even at `handle_count == 0` and neither
+      `--force` nor `--lazy` set). Non-`/system` targets and numeric
+      `<mount-id>` targets are unaffected (the latter is a real, documented
+      scope limit — see `target_is_system`'s own doc comment). Same
+      missing-broker-cap blocker as `--force` below.
+
 ## Next milestone
 
 M1–M5 are all landed. Follow-up work belongs to new issues, not a
@@ -219,7 +234,8 @@ named milestone in this checklist: the three M2 kernel/library gaps
 `dispatch_umount` rewiring, `KIND_PDXFS_MOUNT_TABLE` row-remove op)
 remain open and block every stub this tool carries from going real;
 a `parent_ep_slot` broker-endpoint cap for `libpdx-elevate` blocks
-`--force` ever reaching a real elevation decision; and a real QEMU
+BOTH `--force` (M3-002) and the `/system` target gate (LE-001, #22)
+from ever reaching a real elevation decision; and a real QEMU
 smoke matrix (per `tests/README.md`) is needed before the syscall-
 reaching happy path and any record emission can be verified
 end-to-end.

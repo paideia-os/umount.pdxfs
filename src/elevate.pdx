@@ -119,4 +119,85 @@ module Elevate = structure {
         ret;
       }
     }
+
+  // ----------------------------------------------------------------------
+  // umount.pdxfs.LE-001 (#22) — SECOND, independent elevate gate:
+  // /system unmount, regardless of --force/--lazy/handle_count
+  // ----------------------------------------------------------------------
+  //
+  // `elevate_request_force_unmount` above gates `--force` past an
+  // IN_USE (open-handle) refusal -- it is only ever reached from
+  // `unmount_op.pdx`'s own handle_count>0 branch. LE-001's own
+  // acceptance criteria ask for a DIFFERENT, orthogonal gate: unmounting
+  // ANY target whose raw argv string classifies as `/system` (per
+  // `TargetResolve::target_is_system`, src/target_resolve.pdx) must
+  // acquire elevation BEFORE the mount-table mutation runs -- even when
+  // handle_count == 0 and neither `--force` nor `--lazy` is set, the
+  // ONLY reachable arm of `unmount_op`'s own force/lazy gate at this
+  // landing (see that file's own module header). These two gates are
+  // genuinely independent predicates (open-handle-and-forcing vs.
+  // target-classification) over independent call chains; this function
+  // is the second one, not a refactor of the first.
+  //
+  // Same fail-closed posture as `elevate_request_force_unmount` above
+  // and mount.pdxfs's own `Elevate::mount_elev_require_system`: the
+  // real, landed `libpdx-elevate.ElevateClientAcquire::elevate_client_
+  // acquire(caps, dur, req_buf, reply_ep_id, reply_buf, mint_ctx_buf) ->
+  // row_id` entry point REQUIRES the caller to already hold a `KIND_
+  // IPC_ENDPOINT` cap over `svc.elevate-broker` at `mint_ctx_buf.
+  // parent_ep_slot` -- a prerequisite this repo's own `caps.decl`
+  // (unchanged since the R90-XREPO.013.M4-001 adoption pass) is
+  // explicit is NOT held: no code path in this repo has ever bound a
+  // real broker-endpoint cap, and no design doc or osarch coordination
+  // point has since minted `umount.pdxfs` one. Fabricating a `mint_ctx_
+  // buf.parent_ep_slot` value this repo cannot honestly populate would
+  // look real without being real -- the exact trap this file's own M1
+  // header (above) already documents avoiding for the `--force` gate.
+  //
+  // `elevate_request_system_unmount` below therefore ALWAYS returns
+  // `ELEV_DENY` -- an honest, fail-closed answer to "can this process
+  // prove it holds elevation to unmount a /system target". Per LE-001's
+  // own acceptance criteria ("Elevate refused -> umount exits non-zero,
+  // mount stays live"), the caller (`src/main.pdx`) treats `ELEV_DENY`
+  // as a hard stop BEFORE `HandleCheck::handle_check_refuse` or
+  // `UnmountOp::unmount_op` is ever called -- no mutation of any kind
+  // is attempted on this arm. `ELEV_GRANT` and the caller-side GRANT
+  // arm (`src/main.pdx`'s own dispatch) are real, wired code paths kept
+  // for the day a broker-endpoint cap exists -- only THIS function's
+  // body needs to change, to a real `elevate_client_acquire` (before
+  // the mutation) + `elevate_client_require` (immediately before the
+  // kernel op) + `elevate_client_cap_check_and_revoke` (on completion)
+  // sequence, per LE-001's own desired end-state. No caller-side ABI
+  // change is needed for that day to arrive.
+  //
+  // Pure leaf, no branches, no nested call, no push/pop.
+  // ----------------------------------------------------------------------
+  //
+  // Upstream: design/tooling/volume-tooling-ux.md §5.2, §8.2
+  // (paideia-os); paideia-os/umount.pdxfs#22 (LE-001); paideia-satellites/
+  // libpdx-elevate README.md "Callers" section + caps.decl (the parent_
+  // ep_slot prerequisite); mount.pdxfs's own src/elevate.pdx (`mount_
+  // elev_require_system` -- the sibling-repo precedent this function's
+  // fail-closed posture and write-up mirror); src/target_resolve.pdx
+  // (this repo, `target_is_system` -- the predicate this gate is keyed
+  // on).
+  // ==========================================================================
+  // elevate_request_system_unmount(mount_point_ptr) -> u64
+  //     (ELEV_DENY | ELEV_GRANT -- see doc comment above: DENY is the
+  //     only value this landing's body can ever produce)
+  //
+  //   rdi = mount_point_ptr  (unused by this landing's body -- kept as a
+  //                           parameter so a future real elevate_client_
+  //                           acquire call has it available without an
+  //                           ABI change, for audit/logging context)
+  // ==========================================================================
+  pub let elevate_request_system_unmount : (u64) -> u64 !{} @{} =
+    fn (mount_point_ptr: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "umount.pdxfs.LE-001 (#22): elevate_request_system_unmount entry point. mount_point_ptr (rdi) is accepted but READ BY NOTHING in this landing's body -- see this function's own doc comment for why no real elevate_client_acquire/elevate_client_require call can be honestly constructed yet (no broker-endpoint cap in this tool's caps.decl). `mov rax, 0` (ELEV_DENY; fail-closed) unconditionally; `ret`. Pure leaf -- no push/pop, no `add reg,[mem]`, no `test`. No labels needed (no branch).",
+      block: {
+        mov rax, 0;                          // ELEV_DENY (fail-closed; see doc comment above)
+        ret;
+      }
+    }
 }
