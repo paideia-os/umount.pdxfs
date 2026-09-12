@@ -158,7 +158,7 @@ shopt -u nullglob
 # ---- build-out/umount.pdxfs.elf.
 if [ "$FAIL" -eq 0 ] && [ "${#OWN_OBJECTS[@]}" -gt 0 ]; then
     echo "[link] ld -T link.ld -> $BUILD_DIR/umount.pdxfs.elf"
-    ld -nostdlib --warn-common --fatal-warnings --gc-sections \
+    ld -nostdlib --warn-common --fatal-warnings --gc-sections -z noexecstack \
         -T link.ld \
         -o "$BUILD_DIR/umount.pdxfs.elf" \
         "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}" "${EXTRA_ARCHIVES[@]}"
