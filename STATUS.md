@@ -78,55 +78,74 @@ full 16-issue breakdown this checklist mirrors.
       model, which is why this landing never passes it a real row.
 - [x] **M2-002** (#5) — `KIND_VOLUME.VOL_OP_QUERY_HANDLE_COUNT` wiring +
       `IN_USE` refusal (exit 5): landed as a documented HARD STUB. New
-      `src/handle_check.pdx`. Confirmed via direct grep of
-      `kind_volume.pdx`: `VOL_OP_MAX` is still 9 (0..9,
-      `VOL_OP_QUERY_*` + `VOL_OP_DEBUG_PRINT` only) — the op has not
-      landed. A SECOND, independent gap: the real `_mount_table[]`
-      per-slot layout carries no cap-slot field, so there is no landed
-      way to derive which `KIND_VOLUME` cap a resolved `mount_id`
-      corresponds to even once the op exists. `handle_check_query`
-      always returns 0 (never in use); `handle_check_refuse`'s
-      refusal LOGIC is real and live (count > 0 AND !force), just
-      structurally unreachable until both gaps close — exactly the
-      "refusal check still runs, just never fires" posture this
-      issue's own instruction asked for.
+      `src/handle_check.pdx`.  **PFS-01 retraction (2026-10-11):** the
+      "`VOL_OP_MAX` is still 9, op has not landed" assertion is
+      STALE.  Direct source read at `kind_volume.pdx` L189-L190
+      confirms `VOL_OP_QUERY_HANDLE_COUNT = 10`, `VOL_OP_MAX = 10`,
+      and the dispatch handler at L1161-L1167 WIRES the op (requires
+      `R_VOL_INVOKE`, returns 0 as a documented stub body because
+      per-row handle-count tracking is a future kernel-side
+      enhancement).  **KERNEL ABI frozen at paideia-os commit
+      `c49a4bff` per
+      [`design/pdxfs/sys-mount-abi.md`](https://github.com/paideia-os/paideia-os/blob/main/design/pdxfs/sys-mount-abi.md)
+      §5.3-5.4** — the ABI edge is open; the stub semantics are
+      intentional (handle_count==0 → consumers never refuse on
+      IN_USE grounds).  The SECOND gap this landing cited
+      (mount_id-to-cap-slot resolution absent from `_mount_table[]`
+      per-slot layout) remains open — `handle_check_query` cannot
+      pass a `KIND_VOLUME` cap slot to `cap_invoke` without resolving
+      `mount_id` → volume_cap first.  **PFS-03** adds path-indexed
+      slot lookup to libpdx-volume; **PFS-13** wires the real
+      `VOL_OP_QUERY_HANDLE_COUNT` call in `handle_check_query` once
+      the resolution path lands.  Today's `handle_check_refuse`
+      refusal LOGIC is real and live and stays unreachable through
+      the real query chain until the kernel-side handle tracking
+      lands (post-PFS scope, called out in `sys-mount-abi.md` §7-3).
 - [x] **M2-003** (#6) — non-force happy path: cache flush + txn drain +
       `CLEAN` checkpoint + superblock resign+rewrite + row remove:
       landed. New `src/unmount_op.pdx`. Step 1 (sys_umount) issues the
-      REAL syscall (sysno 76, `rdi=mount_id, rsi=flags`) — a genuine
-      finding at this landing: the kernel BODY
-      (`sys_umount.pdx`, R53.M2-003 #1738) is complete, but
-      `dispatch.pdx`'s `dispatch_umount` label was never rewired off
-      its original R53.M2-001 (#1736) `-ENOSYS` stub, confirmed by
-      direct read of `dispatch.pdx` as of this landing — `sys_umount`
-      is unreachable from ring 3 today regardless of caller args. This
-      file treats that deterministic `-ENOSYS` as a documented stub
-      condition (stub_mask bit 0), not a hard failure, and CONTINUES
-      the pipeline — any OTHER negative return is a genuine failure
-      that aborts (`UO_RC_KERNEL_ERROR`, remaining steps skipped).
-      Steps 2-4 (cache flush/txn drain, CLEAN checkpoint, superblock
-      re-sign) and step 5 (row remove) each stub with their own mask
-      bit — no `KIND_VOLUME` op name, no userspace-callable checkpoint
-      primitive, no in-memory superblock buffer/signing seed available
-      to this tool, and no remove-row op in `KIND_PDXFS_MOUNT_TABLE`'s
-      real catalog (`PMT_OP_MAX` = 3: LIST/READ_ROW/APPEND_ROW/
-      QUERY_SLOT_COUNT) respectively. The overall happy path still
-      completes and emits `result_code: OK` with the accumulated
-      `stub_mask` in the record's metadata, per this issue's own
-      instruction. `main.pdx` now wires all three modules together
-      (exit 0 = OK, 3 = MOUNT_NOT_FOUND, 5 = IN_USE, 6 = KERNEL_ERROR);
-      `unmount_record.pdx` gained `unmount_record_emit_result` (the
-      real five-field emitter) and `unmount_record_write_u64_dec` (a
-      shared decimal-conversion helper extracted from the M1 dry-run
-      emitter's own inline logic).
+      REAL syscall (sysno 76) — but against the WRONG ABI.  **PFS-01
+      retraction (2026-10-11):** the "`dispatch_umount` was never
+      rewired off its original R53.M2-001 `-ENOSYS` stub" assertion
+      is STALE.  Direct source read at `dispatch.pdx` L2463-L2470
+      confirms `dispatch_umount` is a wired shim that reads
+      `_current_tcb` into rdi and calls `sys_umount_shim` with
+      the path-based ABI (`rsi=path_va, rdx=path_len, rcx=flags`).
+      **KERNEL ABI frozen at paideia-os commit `c49a4bff` per
+      [`design/pdxfs/sys-mount-abi.md`](https://github.com/paideia-os/paideia-os/blob/main/design/pdxfs/sys-mount-abi.md)
+      §3** — not the `rdi=mount_id, rsi=flags` call shape this file
+      issued.  The `UO_STUB_UMOUNT_ENOSYS` (bit 0) accommodation this
+      landing made for a deterministic `-ENOSYS` is unreachable
+      today; what the current call actually produces is an ABI-mismatch
+      result that the pipeline treats as `UO_RC_KERNEL_ERROR`.
+      **PFS-13 lands the rewrite** (`src/unmount_op.pdx` against the
+      frozen path-based `sys_umount_shim` ABI; derives
+      `mount_point_va`/`len` from the argv target; `handle_check_query`
+      real `VOL_OP_QUERY_HANDLE_COUNT` wire; `PMT_OP_REMOVE_ROW` cap
+      invoke).  **PFS-14 closes CLEAN-checkpoint** (cache flush op
+      discovery + wire; superblock re-sign real body against PFS-04's
+      `mldsa65_verify` cross-repo landing).  Steps 2-4 and step 5
+      stub bits each have a PFS-13/PFS-14 close path spelled out in
+      [sys-mount-abi.md §5-6](https://github.com/paideia-os/paideia-os/blob/main/design/pdxfs/sys-mount-abi.md).
+      Also stale: the "`PMT_OP_MAX = 3`, no remove-row op" bullet —
+      direct source read at `kind_pdxfs_mount_table.pdx` L183 confirms
+      `PMT_OP_REMOVE_ROW = 4`, `PMT_OP_MAX = 4`, and the dispatch
+      handler at L798-L810 WIRES the op (requires `R_PMT_WRITE`,
+      stub body returns 0; real per-row removal happens implicitly in
+      `umount_pdxfs_block`'s own step 10).  The ABI edge is open.
+      `main.pdx`'s wire-up (exit 0 = OK, 3 = MOUNT_NOT_FOUND,
+      5 = IN_USE, 6 = KERNEL_ERROR) and the record emitters are
+      unchanged by this retraction.
 
 Three kernel/library gaps surfaced independently across M2-001/002/003
 are flagged for main in full in `caps.decl` and `design/architecture.md`
-§7 (updated): (a) no ambient `KIND_PDXFS_MOUNT_TABLE` cap-slot
-convention + no path-comparable field in the real per-slot layout +
-no remove-row op; (b) `VOL_OP_QUERY_HANDLE_COUNT` unlanded + no
-mount_id-to-cap-slot resolution path; (c) `dispatch_umount` unwired to
-its own landed body.
+§7.  **Of those three, (b) and (c) are RETRACTED per PFS-01**:
+`VOL_OP_QUERY_HANDLE_COUNT` is wired (stub body returns 0) and
+`dispatch_umount` is wired to the landed body via the path-based ABI.
+The remaining real gap is (a) — no ambient `KIND_PDXFS_MOUNT_TABLE`
+cap-slot convention + no path-indexed slot lookup helper + the
+`PMT_OP_REMOVE_ROW` ABI edge is open-but-stubbed kernel-side.
+PFS-02 (cap seed) + PFS-03 (path-indexed lookup) close (a).
 
 ### M3 — `--lazy` + `--force` + audit-first + semantic-pipe — **landed**
 
@@ -228,17 +247,39 @@ its own landed body.
 
 ## Next milestone
 
-M1–M5 are all landed. Follow-up work belongs to new issues, not a
-named milestone in this checklist: the three M2 kernel/library gaps
-(`VOL_OP_QUERY_HANDLE_COUNT` + mount_id-to-cap-slot resolution,
-`dispatch_umount` rewiring, `KIND_PDXFS_MOUNT_TABLE` row-remove op)
-remain open and block every stub this tool carries from going real;
-a `parent_ep_slot` broker-endpoint cap for `libpdx-elevate` blocks
-BOTH `--force` (M3-002) and the `/system` target gate (LE-001, #22)
-from ever reaching a real elevation decision; and a real QEMU
-smoke matrix (per `tests/README.md`) is needed before the syscall-
-reaching happy path and any record emission can be verified
-end-to-end.
+M1–M5 are all landed.  Follow-up work is driven by the **PFS AISSUE
+wave** (paideia-os PFS-01..PFS-17, filed 2026-10-11).  **KERNEL ABI
+frozen at paideia-os commit `c49a4bff` per
+`design/pdxfs/sys-mount-abi.md` (PFS-01).**  Ticket map for this
+repo's remaining work:
+
+1. **PFS-13 — ABI reconciliation + handle-count real query.**
+   Rewrites `src/unmount_op.pdx` to the frozen path-based
+   `sys_umount_shim` ABI (per sys-mount-abi.md §3); replaces
+   `handle_check_query`'s hard-coded 0 stub with a real
+   `VOL_OP_QUERY_HANDLE_COUNT` cap_invoke (kernel's own stub still
+   returns 0, but the user-space wire is complete); issues the real
+   `PMT_OP_REMOVE_ROW` cap_invoke at step 5.  Closes
+   `UO_STUB_UMOUNT_ENOSYS`, `UO_STUB_ROW_REMOVE`.  Depends on PFS-01
+   (this freeze), PFS-02 (`_init_caps` seed), PFS-03 (path-indexed
+   slot lookup).
+2. **PFS-14 — CLEAN-checkpoint pipeline closure.**  Cache flush op
+   discovery + wire; superblock re-sign real body (consumes PFS-04's
+   `mldsa65_verify` landed in paideia-as); closes every `UO_STUB_*`
+   mask bit except LAZY_DEFERRED and ELEVATION_DENIED.  Depends on
+   PFS-04 (cross-repo paideia-as), PFS-13.
+3. **PFS-15 — `--force` + `--lazy` end-to-end.**
+   `elevate_request_force_unmount` real body (consumes PFS-02's
+   `KIND_ELEVATE_CHANNEL` broker-endpoint cap); `--lazy` DEFERRED
+   completion record on last-handle-close (user-space poll loop per
+   sys-mount-abi.md §7-5; kernel-side finaliser is post-PFS scope).
+   Depends on PFS-02, PFS-13.
+4. **PFS-16 — Corpus harness + QEMU CLI integration smoke.**
+   Fixture-volume mkfs → mount → write → umount → remount → readback
+   matrix (10+ cases including lazy/force/elevate-required).
+   Depends on PFS-10..PFS-15.
+5. **LE-001 (filed under umount.pdxfs #22) — `/system` elevate gate**
+   stays unreachable until PFS-15 lands.  Behaviour unchanged.
 
 ## Upstream design
 
