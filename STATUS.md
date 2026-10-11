@@ -274,6 +274,24 @@ repo's remaining work:
    completion record on last-handle-close (user-space poll loop per
    sys-mount-abi.md §7-5; kernel-side finaliser is post-PFS scope).
    Depends on PFS-02, PFS-13.
+
+   **PFS-02 seed convention landed as design doc at paideia-os
+   `design/pdxfs/init-caps-seed-convention.md` (2026-10-11)** —
+   slot 4 = `KIND_PDXFS_MOUNT_TABLE` (0x1A5) with
+   `R_PMT_INVOKE|R_PMT_WRITE` (0x00A) for `PMT_OP_REMOVE_ROW` at
+   `src/unmount_op.pdx` step 5 + the eventual `PMT_OP_LIST` /
+   `PMT_OP_READ_ROW` mount-table walk in `src/target_resolve.pdx`;
+   slot 5 = `KIND_IPC_ENDPOINT` (0x005) to
+   `ELEVATE_BROKER_ENDPOINT_ID = 16` with
+   `R_IPC_INVOKE|R_IPC_WRITE` (0x00A) for
+   `elevate_request_force_unmount` and
+   `elevate_request_system_unmount`.  Cap seed from PID 1
+   `_init_caps` per `design/pdxfs/init-caps-seed-convention.md` is
+   the authority root; kernel enablement (grow `KIND_SEEDABLE_TABLE`
+   by two entries, singleton-row mint path, broker-endpoint
+   seed-time gate) is stubbed in §6 of the doc and tracked as the
+   PFS-02 kernel-side follow-up.  Both LE-001 (#22) and the M3-002
+   `--force` stub resolve once the follow-up lands.
 4. **PFS-16 — Corpus harness + QEMU CLI integration smoke.**
    Fixture-volume mkfs → mount → write → umount → remount → readback
    matrix (10+ cases including lazy/force/elevate-required).
