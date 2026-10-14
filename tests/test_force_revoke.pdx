@@ -2,24 +2,28 @@
 // TestForceRevoke: `--force` correctness matrix.
 //
 // This issue's own task text asks to assert "ELEVATION_STUB (per
-// fail-closed) OR OK-with-revoked_handles-list". Only the FIRST arm is
-// reachable at this landing: `src/elevate.pdx`'s `elevate_request_
-// force_unmount` is a fail-closed stub that always returns `ELEV_DENY`
-// (no broker-endpoint cap exists for a real `libpdx-elevate` request --
-// see that file's own module header), so `UnmountOp::unmount_op`'s
-// `ELEV_GRANT` arm (the "OK-with-revoked_handles-list" branch) is real,
-// wired code but structurally unreachable through this call chain
-// today, matching this issue's own "(never in-tree)" framing for the
-// GRANT case elsewhere in this landing's brief.
+// fail-closed) OR OK-with-revoked_handles-list". PFS-15 (paideia-os#2582)
+// LANDED a new, more-honest fail-closed arm: `elevate_request_force_
+// unmount` now consults the .bss `umnt_elev_broker_slot` sentinel (the
+// mint_wire pattern -- see src/elevate.pdx's module header for the full
+// write-up) and returns `ELEV_NO_SLOT` (2) when it is zero, which maps
+// to `UO_RC_NO_ELEVATE` (8) through unmount_op and to the new exit code
+// 10 (`UMOUNT_ERR_NO_ELEVATE`) in main.pdx. The ORIGINAL `ELEV_DENY` /
+// `UO_RC_ELEVATION_STUB` arm is still wired (it is the broker-side
+// REFUSAL case, distinct from the no-broker-cap case) but is no longer
+// reachable with the slot zero-defaulted -- this test updates to assert
+// the PFS-15 reachable arm. The `ELEV_GRANT` arm (the OK-with-revoked_
+// handles branch) remains structurally unreachable at this landing per
+// the same brief, pending PFS-02's kernel-side seed enablement.
 //
 // Four subtests:
 //   1. `HandleCheck::handle_check_decide(1, 1, 0)` -> `HC_PROCEED` (0)
 //      -- confirms `--force` bypasses the up-front refusal gate.
-//   2. `Elevate::elevate_request_force_unmount(mount_id)` -> `ELEV_DENY`
-//      (0) -- the fail-closed elevation check itself, called directly.
+//   2. `Elevate::elevate_request_force_unmount(mount_id)` -> `ELEV_NO_
+//      SLOT` (2) -- the PFS-15 fail-closed arm, called directly.
 //   3. `UnmountOp::unmount_op(mount_id=9, umount_flags=0x2, handle_
-//      count=1, out_stub_mask_ptr)` -> `UO_RC_ELEVATION_STUB` (5).
-//   4. The written stub_mask has `UO_STUB_ELEVATION_DENIED` (0x40) set.
+//      count=1, out_stub_mask_ptr)` -> `UO_RC_NO_ELEVATE` (8).
+//   4. The written stub_mask has `UO_STUB_NO_ELEVATE` (0x200) set.
 //
 // Return-code convention (matches tests/README.md): 0 = all four
 // subtests passed; 1..4 = the 1-based ordinal of the first failure.
@@ -43,7 +47,7 @@ module TestForceRevoke = structure {
   pub let run : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "umount.pdxfs.M4-004 (#14): TestForceRevoke::run entry point. Subtest 1: rdi=1 (handle_count), rsi=1 (force_bit), rdx=0 (lazy_bit); call handle_check_decide -> cmp rax,0 (HC_PROCEED); jne tfr_case1_fail. Subtest 2: rdi=9 (mount_id, arbitrary nonzero); call elevate_request_force_unmount -> cmp rax,0 (Elevate::ELEV_DENY); jne tfr_case2_fail. Subtest 3+4: lea rcx,[rip+tfr_stub_mask]; rdi=9 (mount_id, same value as subtest 2 for trace readability), rsi=2 (umount_flags=PA_FLAG_FORCE), rdx=1 (handle_count); call unmount_op -> cmp rax,5 (UO_RC_ELEVATION_STUB); jne tfr_case3_fail. lea r11,[rip+tfr_stub_mask]; mov rax,[r11]; and rax,0x40; cmp rax,0; je tfr_case4_fail (UO_STUB_ELEVATION_DENIED). Falls through to xor rax,rax; ret (0, all four passed). No `add reg,[mem]`. No `test`. Label prefix tfr_.",
+      justification: "umount.pdxfs.M4-004 (#14) + PFS-15 (paideia-os#2582): TestForceRevoke::run entry point. Subtest 1 (unchanged from M4-004): rdi=1 (handle_count), rsi=1 (force_bit), rdx=0 (lazy_bit); call handle_check_decide -> cmp rax,0 (HC_PROCEED); jne tfr_case1_fail. Subtest 2 (PFS-15: expected rax changed from 0=ELEV_DENY to 2=ELEV_NO_SLOT): rdi=9 (mount_id, arbitrary nonzero); call elevate_request_force_unmount -> cmp rax,2 (Elevate::ELEV_NO_SLOT); jne tfr_case2_fail. Subtest 3 (PFS-15: expected rax changed from 5=UO_RC_ELEVATION_STUB to 8=UO_RC_NO_ELEVATE): lea rcx,[rip+tfr_stub_mask]; rdi=9 (mount_id, same value as subtest 2 for trace readability), rsi=2 (umount_flags=PA_FLAG_FORCE), rdx=1 (handle_count); call unmount_op -> cmp rax,8 (UO_RC_NO_ELEVATE); jne tfr_case3_fail. Subtest 4 (PFS-15: expected stub bit changed from 0x40=UO_STUB_ELEVATION_DENIED to 0x200=UO_STUB_NO_ELEVATE): lea r11,[rip+tfr_stub_mask]; mov rax,[r11]; and rax,0x200; cmp rax,0; je tfr_case4_fail. Falls through to xor rax,rax; ret (0, all four passed). No `add reg,[mem]`. No `test`. Label prefix tfr_.",
       block: {
         // ---- Subtest 1: the up-front bypass gate. ---------------------------
         mov rdi, 1;                          // handle_count
@@ -53,25 +57,34 @@ module TestForceRevoke = structure {
         cmp rax, 0;                          // HandleCheck::HC_PROCEED
         jne tfr_case1_fail;
 
-        // ---- Subtest 2: the elevation check itself, called directly. --------
+        // ---- Subtest 2 (PFS-15): the elevation check itself, called directly. ----
+        //      Expected rax changed from ELEV_DENY (0) to ELEV_NO_SLOT (2):
+        //      the broker-endpoint cap sentinel defaults to zero, so the
+        //      no-slot arm is the only reachable value at this landing.
         mov rdi, 9;                          // mount_id (arbitrary nonzero)
         call elevate_request_force_unmount;
-        cmp rax, 0;                          // Elevate::ELEV_DENY
+        cmp rax, 2;                          // Elevate::ELEV_NO_SLOT (PFS-15)
         jne tfr_case2_fail;
 
-        // ---- Subtest 3+4: unmount_op's own ELEVATION_STUB gate + stub bit. --
+        // ---- Subtest 3+4 (PFS-15): unmount_op's new NO_ELEVATE gate + stub bit. --
+        //      Expected result-code changed from UO_RC_ELEVATION_STUB (5)
+        //      to UO_RC_NO_ELEVATE (8); expected stub bit from
+        //      UO_STUB_ELEVATION_DENIED (0x40) to UO_STUB_NO_ELEVATE
+        //      (0x200). The elevate call's new return value (ELEV_NO_SLOT)
+        //      routes unmount_op to umnt_op_no_elevate rather than the
+        //      ELEV_DENY fallthrough that set 0x40 before.
         lea rcx, [rip + tfr_stub_mask];
         mov rdi, 9;                          // mount_id
         mov rsi, 2;                          // umount_flags = PA_FLAG_FORCE
         mov rdx, 1;                          // handle_count
         call unmount_op;
 
-        cmp rax, 5;                          // UnmountOp::UO_RC_ELEVATION_STUB
+        cmp rax, 8;                          // UnmountOp::UO_RC_NO_ELEVATE (PFS-15)
         jne tfr_case3_fail;
 
         lea r11, [rip + tfr_stub_mask];
         mov rax, [r11 + 0];
-        and rax, 0x40;                       // UnmountOp::UO_STUB_ELEVATION_DENIED
+        and rax, 0x200;                      // UnmountOp::UO_STUB_NO_ELEVATE (PFS-15)
         cmp rax, 0;
         je tfr_case4_fail;
 

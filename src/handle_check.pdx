@@ -111,19 +111,69 @@ module HandleCheck = structure {
   pub let HC_PROCEED : u64 = 0
   pub let HC_REFUSE  : u64 = 1
 
+  // --- PFS-15 (paideia-os#2582): the KIND_VOLUME cap slot handle_check_
+  //     query + unmount_op's revoke loop both invoke on. .bss sentinel,
+  //     default zero -- a future wire from `target_resolve.pdx`'s mount-
+  //     table walk (once `KIND_PDXFS_MOUNT_TABLE` grows a per-row volume-
+  //     cap-slot query op) writes the resolved slot number here before
+  //     `handle_check_refuse` runs. Shared with `src/unmount_op.pdx`'s
+  //     revoke sweep via a rip-relative [rip + umnt_vol_cap_slot] load
+  //     (same cross-module .bss convention mkfs.pdxfs's volume_device_
+  //     slot.pdx uses for its own placeholder). On zero (the only
+  //     reachable value today), `handle_check_query` short-circuits to
+  //     its M2-era `xor rax, rax; ret` posture rather than issue a cap_
+  //     invoke against slot 0, which would surface INVOKE_RESULT_INVALID_
+  //     HANDLE (0xFFFFFFFFFFFFFFFE != 0) and wrongly refuse every
+  //     unmount. ------------------------------------------------------
+  pub let mut umnt_vol_cap_slot : u64 = uninit @align(8)
+
+  // --- SC+ ID for cap_invoke (matches mount.pdxfs's own volume_device_
+  //     slot.pdx and the frozen SC+ freeze alignment table). ------------
+  pub let HC_SC_CAP_INVOKE : u64 = 4
+
+  // --- Op code for VOL_OP_QUERY_HANDLE_COUNT (ordinal 10, see
+  //     `src/kernel/core/cap/kind_volume.pdx`). op_arg[63:8] must be 0 for
+  //     this op, so the op_arg value handed to cap_invoke is just the op
+  //     ordinal itself. ------------------------------------------------
+  pub let HC_OP_QUERY_HANDLE_COUNT : u64 = 10
+
   // ==========================================================================
-  // handle_check_query(mount_id) -> u64  (always 0 at M2 -- see module header)
+  // handle_check_query(mount_id) -> u64
   //
-  // Pure leaf, no push/pop, touches only rax. mount_id (rdi) is accepted
-  // for ABI parity with the real future body (see module header) but is
-  // not read -- there is nothing this stub can look up with it.
+  // umount.pdxfs.M2-002 (#5) stub -> PFS-15 (#2582) real-wire-on-provisioned.
+  // When [rip + umnt_vol_cap_slot] is nonzero (the day PFS-02 seeds the
+  // cap), issues a real `cap_invoke(vol_slot, op_arg = HC_OP_QUERY_
+  // HANDLE_COUNT = 10)` via SC+ ID 4 -- the kernel-side body is itself
+  // still a stub-return-zero (per `kind_volume.pdx`'s VOL_OP_QUERY_HANDLE_
+  // COUNT declaration), but the user-space wire is complete end-to-end.
+  // When the slot is zero (the only reachable value today, pending the
+  // mount-table -> cap-slot wire described in the module-level sentinel's
+  // comment), short-circuits to M2's `xor rax, rax; ret` rather than
+  // invoking against an invalid slot. mount_id (rdi) is still accepted
+  // for ABI parity; the real body does not read it (the cap slot IS the
+  // resolution; mount_id's role is purely diagnostic / audit).
+  //
+  // Pure leaf at the syscall boundary (rax/rdi/rsi caller-save; SYSCALL
+  // preserves callee-save by the amd64 fast-syscall convention). No
+  // push/pop needed.
   // ==========================================================================
-  pub let handle_check_query : (u64) -> u64 !{mem} @{} =
+  pub let handle_check_query : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (mount_id: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "umount.pdxfs.M2-002 (#5): handle_check_query entry point. Hard stub -- see module header for the two independent gaps (VOL_OP_QUERY_HANDLE_COUNT not landed kernel-side; no mount_id -> KIND_VOLUME cap-slot resolution path exists in the real _mount_table[] per-slot layout) that make a real cap-invoke here impossible without fabricating a slot number. Body: `xor rax, rax; ret` -- always reports zero open handles. mount_id (rdi) is accepted but unread, kept only so a future real body's signature does not change at its call site in handle_check_refuse. No `add reg,[mem]`, no `test`. Label prefix umnt_hc_ (no branch labels needed at this stub's size).",
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "umount.pdxfs.M2-002 (#5) + PFS-15 (paideia-os#2582): handle_check_query entry point. mov rax, [rip + umnt_vol_cap_slot]; cmp rax,0; je umnt_hc_query_no_slot -> `xor rax, rax; ret` (the M2 stub posture, kept so the slot==0 case does not fire cap_invoke against an invalid handle). Nonzero slot: mov rdi, rax (slot), mov rsi, 10 (HC_OP_QUERY_HANDLE_COUNT, op_arg[63:8]==0 since this op refuses nonzero high bits per kind_volume.pdx), mov rax, 4 (HC_SC_CAP_INVOKE), syscall; ret -- the kernel's rax IS our return (handle_count on success; INVOKE_RESULT_* sentinels on failure, which main.pdx's handle_check_decide treats as nonzero -> HC_REFUSE, fail-closed). mount_id (rdi) is accepted but unread -- the cap slot is the resolution surface, not the mount_id. Pure leaf at the syscall boundary: rax/rdi/rsi all SysV caller-save, no push/pop needed; SYSCALL preserves callee-save registers under the amd64 fast-syscall convention. No `add reg,[mem]`, no `test`. Labels prefixed umnt_hc_query_.",
       block: {
-        xor rax, rax;
+        mov rax, [rip + umnt_vol_cap_slot];
+        cmp rax, 0;
+        je umnt_hc_query_no_slot;
+
+        mov rdi, rax;                      // slot
+        mov rsi, 10;                       // HC_OP_QUERY_HANDLE_COUNT (op_arg == op; high bits 0)
+        mov rax, 4;                        // HC_SC_CAP_INVOKE
+        syscall;
+        ret;
+
+      umnt_hc_query_no_slot:
+        xor rax, rax;                      // M2 stub posture (fail-closed to proceed)
         ret;
       }
     }
@@ -181,22 +231,41 @@ module HandleCheck = structure {
   //                              PdxFsUnmountRecord@0.1's handle_count
   //                              field even on the HC_PROCEED path)
   //
-  // No push/pop needed: handle_check_query touches only rax (mount_id
-  // in rdi is caller-save and dies after the call), so rsi/rdx/rcx
-  // (force_bit/lazy_bit/out_handle_count_ptr) survive the nested call
-  // untouched, and handle_check_decide is itself a pure rax-only leaf.
+  // PFS-15 (paideia-os#2582) register plan: before PFS-15,
+  // handle_check_query was a pure `xor rax, rax; ret` leaf, so rsi/rdx/
+  // rcx all survived the nested call untouched. After PFS-15 the query
+  // can issue a SYSCALL on the (today-unreachable) provisioned-slot arm,
+  // and the kernel's #743 info-leak hardening zeroes EVERY caller-save
+  // register on sysret -- so rsi/rdx/rcx would be clobbered. This file
+  // now stages all three into callee-save registers (rbx/r12/r13) BEFORE
+  // the query call and restores them from those slots after. The three-
+  // register save shape also lands rsp%16==0 at the handle_check_decide
+  // call site (entry rsp%16==8; 3 pushes = 24 bytes -> rsp%16==0).
   // ==========================================================================
-  pub let handle_check_refuse : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+  pub let handle_check_refuse : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
     fn (mount_id: u64) (force_bit: u64) (lazy_bit: u64) (out_handle_count_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "umount.pdxfs.M2-002 (#5) + M3-001 (#7): handle_check_refuse entry point. `call handle_check_query` with rdi already == mount_id (no re-mov needed) -> rax = handle_count (always 0 at M2/M3, per that function's own stub); rsi/rdx/rcx survive untouched (handle_check_query touches only rax). `mov [rcx+0], rax` writes the count out unconditionally. Then `mov rdi, rax` (handle_count); rsi/rdx already hold force_bit/lazy_bit in the exact positions handle_check_decide's own signature needs -- `call handle_check_decide` and return its result verbatim (a plain tail delegation, no further branching needed here). Given handle_check_query's current stub always returns 0, HC_REFUSE is unreachable through THIS call chain at M2/M3 -- handle_check_decide itself (module header) is directly testable with a real nonzero handle_count. No `add reg,[mem]`, no `test`. Labels prefixed umnt_hc_ (none needed at this function's size).",
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "umount.pdxfs.M2-002 (#5) + M3-001 (#7) + PFS-15 (paideia-os#2582): handle_check_refuse entry point. 3-push callee-save plan (rbx=force_bit, r12=lazy_bit, r13=out_handle_count_ptr). Entry rsp%16==8, 3 pushes 24B -> rsp%16==0 for both nested calls (handle_check_query, handle_check_decide). `call handle_check_query` with rdi already == mount_id (no re-mov needed) -> rax = handle_count (always 0 at this landing via that function's no-slot short-circuit, per PFS-15's module-level sentinel comment); rsi/rdx/rcx may have been zeroed by the kernel's #743 hardening on the (future) provisioned-slot syscall arm, so this file loads them FRESH from rbx/r12/r13 after the call. `mov [r13+0], rax` writes the count out unconditionally. Then `mov rdi, rax` (handle_count), `mov rsi, rbx` (force_bit, restored), `mov rdx, r12` (lazy_bit, restored); `call handle_check_decide` and return its result verbatim. Pops r13/r12/rbx (reverse push order) before `ret`. Given handle_check_query's current no-slot short-circuit always returns 0, HC_REFUSE is unreachable through THIS call chain at this landing -- handle_check_decide itself (module header) is directly testable with a real nonzero handle_count. No `add reg,[mem]`, no `test`. Labels prefixed umnt_hc_ (none needed at this function's size).",
       block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rsi;                      // rbx = force_bit
+        mov r12, rdx;                      // r12 = lazy_bit
+        mov r13, rcx;                      // r13 = out_handle_count_ptr
+
         call handle_check_query;           // rdi = mount_id already in place
-        mov [rcx + 0], rax;                // *out_handle_count_ptr = handle_count
+        mov [r13 + 0], rax;                // *out_handle_count_ptr = handle_count
 
         mov rdi, rax;                      // handle_count
-        // rsi = force_bit, rdx = lazy_bit already in place.
+        mov rsi, rbx;                      // force_bit (restored)
+        mov rdx, r12;                      // lazy_bit (restored)
         call handle_check_decide;
+
+        pop r13;
+        pop r12;
+        pop rbx;
         ret;
       }
     }

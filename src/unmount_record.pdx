@@ -125,6 +125,14 @@ module UnmountRecord = structure {
   //     ELEVATION_STUB above, which is --force-specific and only
   //     reachable from inside unmount_op's own handle_count>0 branch).
   pub let UR_RC_SYSTEM_UNMOUNT_REFUSED : u64 = 7
+  // --- PFS-15 (paideia-os#2582) additions: --force end-to-end. The two
+  //     NEW result codes keep the "mirrored (duplicated), not cross-
+  //     module-referenced" convention this repo established at M2-003
+  //     -- UO_RC_NO_ELEVATE (8) and UO_RC_REVOKE_FAIL (9) in src/unmount_
+  //     op.pdx share the numeric values but the two files cross-reference
+  //     by comment, not by `pub let`. --------------------------------
+  pub let UR_RC_NO_ELEVATE       : u64 = 8   // PFS-15: broker-endpoint cap unprovisioned
+  pub let UR_RC_REVOKE_FAIL      : u64 = 9   // PFS-15: VOL_OP_REVOKE_HANDLE refused mid-sweep
 
   pub let ur_lit_mount_id     : [u8; 13] = ", mount_id: \0"
   pub let ur_lit_result_code  : [u8; 16] = ", result_code: \0"
@@ -140,6 +148,8 @@ module UnmountRecord = structure {
   pub let ur_lit_rc_elevation_stub   : [u8; 15] = "ELEVATION_STUB\0"
   pub let ur_lit_rc_sig_key_locked   : [u8; 15] = "SIG_KEY_LOCKED\0"
   pub let ur_lit_rc_system_unmount_refused : [u8; 23] = "SYSTEM_UNMOUNT_REFUSED\0"
+  pub let ur_lit_rc_no_elevate       : [u8; 11] = "NO_ELEVATE\0"
+  pub let ur_lit_rc_revoke_fail      : [u8; 12] = "REVOKE_FAIL\0"
 
   // ==========================================================================
   // unmount_record_strlen(s) -> u64
@@ -512,6 +522,10 @@ module UnmountRecord = structure {
         je umnt_ur_res_sig_key_locked;
         cmp r13, 7;
         je umnt_ur_res_system_unmount_refused;
+        cmp r13, 8;
+        je umnt_ur_res_no_elevate;
+        cmp r13, 9;
+        je umnt_ur_res_revoke_fail;
 
         lea rsi, [rip + ur_lit_rc_mount_not_found];
         mov rdx, 15;
@@ -550,6 +564,16 @@ module UnmountRecord = structure {
       umnt_ur_res_system_unmount_refused:
         lea rsi, [rip + ur_lit_rc_system_unmount_refused];
         mov rdx, 22;
+        jmp umnt_ur_res_emit;
+
+      umnt_ur_res_no_elevate:
+        lea rsi, [rip + ur_lit_rc_no_elevate];
+        mov rdx, 10;
+        jmp umnt_ur_res_emit;
+
+      umnt_ur_res_revoke_fail:
+        lea rsi, [rip + ur_lit_rc_revoke_fail];
+        mov rdx, 11;
 
       umnt_ur_res_emit:
         mov rdi, 1;

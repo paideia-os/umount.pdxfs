@@ -209,18 +209,22 @@
 module UnmountOp = structure {
 
   // --- unmount_op status codes. Deliberately share numeric values with
-  //     UnmountRecord::UR_RC_* (0/2/4/5/6) -- this repo's own
+  //     UnmountRecord::UR_RC_* (0/2/4/5/6/8/9) -- this repo's own
   //     established "no cross-module pub let numeric reference"
   //     convention (see M2-003's own module header for the precedent).
   //     1 (IN_USE) and 3 (MOUNT_NOT_FOUND) are deliberately skipped --
   //     unmount_op never returns either; those are main.pdx's own
   //     literals for the two gates that run BEFORE unmount_op is ever
-  //     called. --------------------------------------------------------
+  //     called. 7 (SYSTEM_UNMOUNT_REFUSED) is likewise main.pdx's own
+  //     code for the LE-001 gate that runs before unmount_op. --------
   pub let UO_RC_OK               : u64 = 0
   pub let UO_RC_KERNEL_ERROR     : u64 = 2
   pub let UO_RC_DEFERRED         : u64 = 4   // M3-001 (#7)
   pub let UO_RC_ELEVATION_STUB   : u64 = 5   // M3-002 (#8)
   pub let UO_RC_SIG_KEY_LOCKED   : u64 = 6   // M3-004 (#10) -- unreachable, see header
+  // --- PFS-15 (paideia-os#2582) additions: --force end-to-end. --------
+  pub let UO_RC_NO_ELEVATE       : u64 = 8   // broker-endpoint cap unprovisioned (ELEV_NO_SLOT)
+  pub let UO_RC_REVOKE_FAIL      : u64 = 9   // VOL_OP_REVOKE_HANDLE refused mid-sweep
 
   // --- Stub-mask bits (see module header for the full write-up). -----------
   pub let UO_STUB_SYS_UMOUNT_ENOSYS : u64 = 0x1
@@ -230,8 +234,10 @@ module UnmountOp = structure {
   pub let UO_STUB_ROW_REMOVE        : u64 = 0x10
   pub let UO_STUB_LAZY_DEFERRED     : u64 = 0x20  // M3-001 (#7)
   pub let UO_STUB_ELEVATION_DENIED  : u64 = 0x40  // M3-002 (#8)
-  pub let UO_STUB_HANDLE_REVOKE     : u64 = 0x80  // M3-002 (#8) -- unreachable (ELEV_GRANT arm)
+  pub let UO_STUB_HANDLE_REVOKE     : u64 = 0x80  // M3-002 (#8) -- unreachable (ELEV_GRANT arm); PFS-15 reclaims this bit as "revoke sweep ran successfully, kernel-side body still stubbed"
   pub let UO_STUB_SIG_KEY_LOCKED    : u64 = 0x100 // M3-004 (#10) -- unreachable, see header
+  pub let UO_STUB_NO_ELEVATE        : u64 = 0x200 // PFS-15: broker-endpoint slot not provisioned
+  pub let UO_STUB_REVOKE_FAIL       : u64 = 0x400 // PFS-15: at least one VOL_OP_REVOKE_HANDLE returned nonzero
 
   // --- sys_umount's -ENOSYS sentinel (standard errno 38, negated). ---------
   pub let UO_ENOSYS : u64 = 0xFFFFFFFFFFFFFFDA
@@ -247,6 +253,19 @@ module UnmountOp = structure {
   //     LV.M1-005 / #20). ---------------------------------------------
   pub let mut umnt_op_sb_scratch : [u8; 4096] = uninit @align(8)   // PDXB_ONDISK_BYTES
   pub let mut umnt_op_seed_zero  : [u8; 32]   = uninit @align(8)   // MLDSA65_SEED_LEN
+
+  // --- PFS-15 (paideia-os#2582): revoke-sweep scratch. handle_count and
+  //     the per-iteration counter both live in .bss rather than on the
+  //     stack: SysV %16 alignment at the nested elevate/syscall call
+  //     sites would need a counting push/pop pair per iteration, while
+  //     the kernel's #743 info-leak hardening zeroes caller-save
+  //     registers on sysret (so even a register-held index would need to
+  //     be reloaded from somewhere every iteration). unmount_op is
+  //     non-reentrant (one unmount at a time per task), so a shared
+  //     module-level pair is correct. Both are u64, zero-initialised by
+  //     the loader before `_start` runs. ------------------------------
+  pub let mut umnt_op_revoke_count : u64 = uninit @align(8)
+  pub let mut umnt_op_revoke_idx   : u64 = uninit @align(8)
 
   // ==========================================================================
   // unmount_op(mount_id, umount_flags, handle_count, out_stub_mask_ptr) -> u64
@@ -275,10 +294,10 @@ module UnmountOp = structure {
   // zeroes every caller-save register on return from) intervene before
   // mount_id/umount_flags are needed again.
   // ==========================================================================
-  pub let unmount_op : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+  pub let unmount_op : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
     fn (mount_id: u64) (umount_flags: u64) (handle_count: u64) (out_stub_mask_ptr: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {fs},
-      justification: "umount.pdxfs.M2-003 (#6) + M3-001 (#7) + M3-002 (#8) + M3-004 (#10): unmount_op entry point. Pushes r12/r13/r14/r15 before repurposing any; pops all four (reverse order) at the single shared epilogue before `ret`. r12=out_stub_mask_ptr (rcx), r13=stub_mask (xor-zeroed), r14=mount_id (rdi), r15=umount_flags (rsi) -- handle_count (rdx) is read ONCE, immediately, before this staging (`cmp rdx,0; je umnt_op_pipeline` skips the whole lazy/force gate when handle_count==0, the only reachable value today per handle_check.pdx's own stub). On handle_count>0: `mov rax,r15; and rax,0x1` (PA_FLAG_LAZY); nonzero -> umnt_op_lazy_deferred: `or r13,0x20` (UO_STUB_LAZY_DEFERRED), write stub_mask, return UO_RC_DEFERRED (4) -- steps 1-5 never run. Otherwise `mov rax,r15; and rax,0x2` (PA_FLAG_FORCE); zero -> falls through to umnt_op_pipeline anyway (handle_count>0 with neither flag is unreachable via handle_check_refuse's own gating, but this file does not re-refuse -- it simply has nothing special to do, matching handle_check.pdx's documented posture). Nonzero force_bit: `mov rdi,r14; call elevate_request_force_unmount` (src/elevate.pdx, real fail-closed call) -> rax in {ELEV_DENY=0, ELEV_GRANT=1}; `cmp rax,1; je umnt_op_force_granted`. DENY (the only reachable value): `or r13,0x40` (UO_STUB_ELEVATION_DENIED), write stub_mask, return UO_RC_ELEVATION_STUB (5) -- steps 1-5 never run. umnt_op_force_granted (real, wired, unreachable): `or r13,0x80` (UO_STUB_HANDLE_REVOKE, documenting the no-kernel-primitive handle-revoke stub) then falls into umnt_op_pipeline exactly like the handle_count==0 case. umnt_op_pipeline (steps 1-5, r14/r15 restored into rdi/rsi for the syscall): mov rdi,r14; mov rsi,r15; mov rax,76; syscall (Step 1, SC+ ID 76 = sys_umount) -- staging r10=UO_ENOSYS sentinel, cmp rax,r10; je umnt_op_umount_enosys (or r13,0x1 then fall through); cmp rax,0; je umnt_op_umount_ok; else genuine kernel error: write stub_mask, return UO_RC_KERNEL_ERROR (2), skipping steps 2-5. umnt_op_umount_ok: or r13,0x2 (cache flush stub); or r13,0x4 (checkpoint stub). Step 4 (M3-004, REAL call): lea rdi,[rip+umnt_op_sb_scratch] (sb_ptr); lea rsi,[rip+umnt_op_seed_zero] (seed_ptr); lea rdx,[rip+umnt_op_sb_scratch]; add rdx,696 (out_sig_ptr = sb_ptr+696, register+immediate, never a two-register lea); mov rcx,3309 (out_sig_len); call pdxb_sign_superblock (libpdx-volume, cross-repo bare-label call, same mechanism target_resolve.pdx already uses for mount_table_snapshot) -> rax. `cmp rax,3309; jne umnt_op_sign_locked` -- unreachable per module header (the intrinsic only fails on a NULL seed_ptr, and umnt_op_seed_zero is a real non-null buffer), but real and live: on that arm, or r13,0x100 (UO_STUB_SIG_KEY_LOCKED), write stub_mask, return UO_RC_SIG_KEY_LOCKED (6), skipping step 5. On the (always-taken) success arm: or r13,0x8 (UO_STUB_SB_RESIGN, now meaning 'real call, placeholder buffer'). Step 5: or r13,0x10 (row remove stub, unchanged). Write final stub_mask; xor rax,rax (UO_RC_OK); fall into the shared epilogue. Epilogue pops r15/r14/r13/r12 (reverse push order) and returns. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed umnt_op_.",
+      effects: {mem, sysreg}, capabilities: {fs, cap},
+      justification: "umount.pdxfs.M2-003 (#6) + M3-001 (#7) + M3-002 (#8) + M3-004 (#10) + PFS-15 (paideia-os#2582): unmount_op entry point. PFS-15 (--force end-to-end): the elevate call now returns three distinct values (ELEV_DENY=0 wired-but-unreachable broker refusal; ELEV_GRANT=1 proceed to revoke sweep; ELEV_NO_SLOT=2 broker-endpoint cap unprovisioned, the only reachable fail-closed arm today), mapped to three distinct UO_RC_* codes (UO_RC_ELEVATION_STUB=5 / UO_RC_NO_ELEVATE=8 / UO_RC_REVOKE_FAIL=9) via three distinct branch arms (umnt_op_force_granted / umnt_op_no_elevate / fallthrough ELEV_DENY). The GRANT arm then runs a real revoke sweep: handle_count stashed into .bss scratch umnt_op_revoke_count before the elevate call (so SysV %16 at the nested call site is preserved without stack use, and the counter survives the loop's inner SYSCALLs); the loop reads [rip + umnt_op_revoke_idx] + [rip + umnt_op_revoke_count], builds op_arg = (i << 8) | VOL_OP_REVOKE_HANDLE (11), issues `cap_invoke(vol_slot, op_arg)` via SC+ ID 4, and aborts the sweep on any nonzero return (treating the no-slot case -- INVOKE_RESULT_INVALID_HANDLE -- as a revoke failure, i.e. fail-closed). On full-sweep success, sets UO_STUB_HANDLE_REVOKE (0x80, reclaimed meaning from M3-002's unreachable stub to 'sweep ran OK against kernel-side VOL_OP_REVOKE_HANDLE stub'). The ELEV_NO_SLOT arm sets UO_STUB_NO_ELEVATE (0x200) and the REVOKE_FAIL arm sets UO_STUB_REVOKE_FAIL (0x400). PRIOR DOC BELOW (unchanged shape, M2/M3 descriptions kept verbatim). Pushes r12/r13/r14/r15 before repurposing any; pops all four (reverse order) at the single shared epilogue before `ret`. r12=out_stub_mask_ptr (rcx), r13=stub_mask (xor-zeroed), r14=mount_id (rdi), r15=umount_flags (rsi) -- handle_count (rdx) is read ONCE, immediately, before this staging (`cmp rdx,0; je umnt_op_pipeline` skips the whole lazy/force gate when handle_count==0, the only reachable value today per handle_check.pdx's own stub). On handle_count>0: `mov rax,r15; and rax,0x1` (PA_FLAG_LAZY); nonzero -> umnt_op_lazy_deferred: `or r13,0x20` (UO_STUB_LAZY_DEFERRED), write stub_mask, return UO_RC_DEFERRED (4) -- steps 1-5 never run. Otherwise `mov rax,r15; and rax,0x2` (PA_FLAG_FORCE); zero -> falls through to umnt_op_pipeline anyway (handle_count>0 with neither flag is unreachable via handle_check_refuse's own gating, but this file does not re-refuse -- it simply has nothing special to do, matching handle_check.pdx's documented posture). Nonzero force_bit: `mov rdi,r14; call elevate_request_force_unmount` (src/elevate.pdx, real fail-closed call) -> rax in {ELEV_DENY=0, ELEV_GRANT=1}; `cmp rax,1; je umnt_op_force_granted`. DENY (the only reachable value): `or r13,0x40` (UO_STUB_ELEVATION_DENIED), write stub_mask, return UO_RC_ELEVATION_STUB (5) -- steps 1-5 never run. umnt_op_force_granted (real, wired, unreachable): `or r13,0x80` (UO_STUB_HANDLE_REVOKE, documenting the no-kernel-primitive handle-revoke stub) then falls into umnt_op_pipeline exactly like the handle_count==0 case. umnt_op_pipeline (steps 1-5, r14/r15 restored into rdi/rsi for the syscall): mov rdi,r14; mov rsi,r15; mov rax,76; syscall (Step 1, SC+ ID 76 = sys_umount) -- staging r10=UO_ENOSYS sentinel, cmp rax,r10; je umnt_op_umount_enosys (or r13,0x1 then fall through); cmp rax,0; je umnt_op_umount_ok; else genuine kernel error: write stub_mask, return UO_RC_KERNEL_ERROR (2), skipping steps 2-5. umnt_op_umount_ok: or r13,0x2 (cache flush stub); or r13,0x4 (checkpoint stub). Step 4 (M3-004, REAL call): lea rdi,[rip+umnt_op_sb_scratch] (sb_ptr); lea rsi,[rip+umnt_op_seed_zero] (seed_ptr); lea rdx,[rip+umnt_op_sb_scratch]; add rdx,696 (out_sig_ptr = sb_ptr+696, register+immediate, never a two-register lea); mov rcx,3309 (out_sig_len); call pdxb_sign_superblock (libpdx-volume, cross-repo bare-label call, same mechanism target_resolve.pdx already uses for mount_table_snapshot) -> rax. `cmp rax,3309; jne umnt_op_sign_locked` -- unreachable per module header (the intrinsic only fails on a NULL seed_ptr, and umnt_op_seed_zero is a real non-null buffer), but real and live: on that arm, or r13,0x100 (UO_STUB_SIG_KEY_LOCKED), write stub_mask, return UO_RC_SIG_KEY_LOCKED (6), skipping step 5. On the (always-taken) success arm: or r13,0x8 (UO_STUB_SB_RESIGN, now meaning 'real call, placeholder buffer'). Step 5: or r13,0x10 (row remove stub, unchanged). Write final stub_mask; xor rax,rax (UO_RC_OK); fall into the shared epilogue. Epilogue pops r15/r14/r13/r12 (reverse push order) and returns. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed umnt_op_.",
       block: {
         push r12;
         push r13;
@@ -311,21 +330,118 @@ module UnmountOp = structure {
         cmp rax, 0;
         je umnt_op_pipeline;                 // neither flag: unreachable via caller gating
 
-        // ---- --force, handle_count > 0: elevate check (real call, #8). -----
+        // ---- --force, handle_count > 0: elevate check (real call, #8/PFS-15). -----
+        //      Return codes: ELEV_DENY (0) = broker-side refusal (unreachable
+        //      today, kept wired); ELEV_GRANT (1) = proceed to revoke sweep;
+        //      ELEV_NO_SLOT (2) = broker-endpoint cap unprovisioned, the
+        //      PFS-15 fail-closed arm reached whenever `_init_caps` has not
+        //      yet seeded slot 5 (the only reachable value at this landing,
+        //      pending PFS-02 kernel-side enablement). The three arms report
+        //      three DISTINCT UO_RC_* codes so main.pdx can select the
+        //      operator-visible exit (ELEVATION_STUB=7 vs NO_ELEVATE=10 vs
+        //      REVOKE_FAIL=11); the record emitter likewise prints three
+        //      distinct `result_code` words.
+        //
+        //      Stash handle_count (rdx, caller-save) into the .bss scratch
+        //      `umnt_op_revoke_count` BEFORE the elevate call -- SysV %16
+        //      alignment at the nested call site is preserved by not
+        //      touching the stack, and the scratch survives the revoke
+        //      loop's inner SYSCALLs too.
+        mov [rip + umnt_op_revoke_count], rdx;
         mov rdi, r14;                       // mount_id
         call elevate_request_force_unmount; // src/elevate.pdx
+
         cmp rax, 1;                         // Elevate::ELEV_GRANT
         je umnt_op_force_granted;
+        cmp rax, 2;                         // Elevate::ELEV_NO_SLOT
+        je umnt_op_no_elevate;
 
-        // ---- ELEV_DENY (the only reachable value at this landing). ---------
+        // ---- ELEV_DENY (real, wired, unreachable today -- the broker-side
+        //      refusal; PFS-15's reachable fail-closed arm is ELEV_NO_SLOT
+        //      above). Reports UO_RC_ELEVATION_STUB for operator-visible
+        //      backward compatibility with M3-002's exit code (7). --------
         or r13, 0x40;                       // UO_STUB_ELEVATION_DENIED
         mov [r12 + 0], r13;
         mov rax, 5;                         // UO_RC_ELEVATION_STUB
         jmp umnt_op_epilogue;
 
+      umnt_op_no_elevate:
+        // ---- PFS-15: broker-endpoint cap not provisioned (the only
+        //      reachable fail-closed arm today). Reports UO_RC_NO_ELEVATE
+        //      so main.pdx can exit with UMOUNT_ERR_NO_ELEVATE (10). ------
+        or r13, 0x200;                      // UO_STUB_NO_ELEVATE
+        mov [r12 + 0], r13;
+        mov rax, 8;                         // UO_RC_NO_ELEVATE
+        jmp umnt_op_epilogue;
+
       umnt_op_force_granted:
-        // ---- Real, wired, unreachable -- handle-revoke stub, then proceed. -
-        or r13, 0x80;                       // UO_STUB_HANDLE_REVOKE
+        // ---- PFS-15: real revoke sweep -- iterate handle_count VOL_OP_
+        //      REVOKE_HANDLE cap_invokes. Each iteration packs the index
+        //      into op_arg[63:8] + op=11 in op_arg[7:0] and issues `cap_
+        //      invoke(vol_slot, op_arg)` via SC+ ID 4. On any nonzero
+        //      return (VOL_OK=0 is success; INVOKE_DENIED, INVOKE_UNSUP,
+        //      VOL_TAIL_BAD_ARG, etc. are failures), the sweep aborts to
+        //      umnt_op_revoke_fail and reports UO_RC_REVOKE_FAIL. On a
+        //      zero-slot .bss sentinel (reachable today, pending the
+        //      mount-table -> cap-slot wire described in handle_check.pdx's
+        //      `umnt_vol_cap_slot` comment), the sweep ALSO fails safe --
+        //      issuing cap_invoke against slot 0 would surface INVOKE_
+        //      RESULT_INVALID_HANDLE (0xFFFFFFFFFFFFFFFE), which the
+        //      per-iteration gate below treats as a failure, so the no-
+        //      slot case reports UO_RC_REVOKE_FAIL rather than wrongly
+        //      proceeding. On full success (every revoke returned VOL_OK),
+        //      sets UO_STUB_HANDLE_REVOKE (0x80, reclaimed from its M3-
+        //      002 "unreachable" meaning to "sweep ran OK, kernel-side
+        //      body still stubbed per kind_volume.pdx's VOL_OP_REVOKE_
+        //      HANDLE declaration") and falls into the normal six-step
+        //      pipeline.
+        //
+        //      Register plan for the loop:
+        //        r8  = iteration index i (caller-save, zeroed in SYSCALL
+        //              return register wipe -- the kernel's #743 info-
+        //              leak hardening zeroes caller-save on sysret, so
+        //              r8 is reloaded fresh from the .bss counter
+        //              `umnt_op_revoke_idx` every iteration).
+        //        [rip + umnt_op_revoke_count] = handle_count (unchanged
+        //              across the loop body -- a straightforward loop
+        //              bound).
+        //        [rip + umnt_op_revoke_idx]  = iteration counter.
+        xor rax, rax;
+        mov [rip + umnt_op_revoke_idx], rax; // i = 0
+
+      umnt_op_revoke_loop:
+        mov r8, [rip + umnt_op_revoke_idx];
+        mov rax, [rip + umnt_op_revoke_count];
+        cmp r8, rax;
+        jae umnt_op_revoke_done;
+
+        // Build op_arg = (i << 8) | VOL_OP_REVOKE_HANDLE (11).
+        mov rsi, r8;
+        shl rsi, 8;
+        or  rsi, 0xB;                       // op code VOL_OP_REVOKE_HANDLE (11) in bits [7:0]
+
+        mov rdi, [rip + umnt_vol_cap_slot]; // slot (0 -> cap_invoke returns INVALID_HANDLE sentinel, caught below)
+        mov rax, 4;                         // SC+ ID 4 = cap_invoke
+        syscall;
+
+        cmp rax, 0;                         // VOL_OK
+        jne umnt_op_revoke_fail;
+
+        // Advance iteration counter via .bss (SYSCALL may have wiped r8).
+        mov rax, [rip + umnt_op_revoke_idx];
+        add rax, 1;
+        mov [rip + umnt_op_revoke_idx], rax;
+        jmp umnt_op_revoke_loop;
+
+      umnt_op_revoke_done:
+        or r13, 0x80;                       // UO_STUB_HANDLE_REVOKE (sweep ran OK)
+        jmp umnt_op_pipeline;
+
+      umnt_op_revoke_fail:
+        or r13, 0x400;                      // UO_STUB_REVOKE_FAIL
+        mov [r12 + 0], r13;
+        mov rax, 9;                         // UO_RC_REVOKE_FAIL
+        jmp umnt_op_epilogue;
 
       umnt_op_pipeline:
         // ---- Step 1: real sys_umount attempt (sysno 76). -------------------

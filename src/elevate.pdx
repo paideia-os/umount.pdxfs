@@ -94,8 +94,48 @@ module Elevate = structure {
   pub let KIND_ELEVATE_CHANNEL_REF : u64 = 0x191
 
   // --- elevate_request_force_unmount return values. -----------------------
-  pub let ELEV_DENY  : u64 = 0
-  pub let ELEV_GRANT : u64 = 1
+  //
+  // PFS-15 (paideia-os#2582) ADDED a third sentinel, ELEV_NO_SLOT (2):
+  // distinguishes "we asked the broker and it denied" (ELEV_DENY) from
+  // "we have no broker-endpoint cap to ask through at all" (ELEV_NO_SLOT).
+  // The surface difference matters for the operator-visible exit code:
+  // ELEV_DENY -> UMOUNT_ERR_REVOKE_FAIL (the broker said no), ELEV_NO_SLOT
+  // -> UMOUNT_ERR_NO_ELEVATE (the tool was never provisioned a broker).
+  // ELEV_NO_SLOT is the ONLY reachable value today, matching mint.pdxfs's
+  // own `mount_mw_elevate_slot` default-zero posture (src/mint_wire.pdx);
+  // ELEV_DENY and ELEV_GRANT are real, wired code paths kept for the day
+  // PFS-02's `_init_caps` seed convention lands kernel-side and the
+  // broker-endpoint cap arrives at slot 5.
+  pub let ELEV_DENY     : u64 = 0
+  pub let ELEV_GRANT    : u64 = 1
+  pub let ELEV_NO_SLOT  : u64 = 2
+
+  // --- PFS-15: broker-endpoint cap slot, mint_wire pattern. ---------------
+  //
+  // PFS-02 (`design/pdxfs/init-caps-seed-convention.md` §2.3, paideia-os
+  // repo) names slot 5 as the canonical `_init_caps` seed slot for a
+  // pdxfs tool's KIND_IPC_ENDPOINT handle on `svc.elevate-broker`
+  // (ELEVATE_BROKER_ENDPOINT_ID = 16). Until PFS-02's kernel-side
+  // enablement wave lands (grow KIND_SEEDABLE_TABLE, singleton-row mint
+  // path, broker-endpoint seed-time gate -- tracked at paideia-os
+  // follow-up), this `.bss` u64 stays zero and every elevate call
+  // refuses with ELEV_NO_SLOT (fail-closed). The slot number is the
+  // SAME number mint.pdxfs's own `mount_mw_elevate_slot` reserves (see
+  // src/mint_wire.pdx in that repo) -- a single ambient seed slot
+  // across every pdxfs CLI tool, by the design-doc convention.
+  //
+  // Future real body (unchanged signature, body-only edit) once PFS-02
+  // closes:
+  //
+  //   mov rax, [rip + umnt_elev_broker_slot];
+  //   cmp rax, 0;
+  //   je no_slot_arm;
+  //   // Build the libpdx-elevate 40-byte mint_ctx_buf (parent_ep_slot =
+  //   // rax; caps = KIND_VOLUME | R_VOL_REVOKE; dur = default; …); call
+  //   // elevate_client_acquire; branch on APPROVED/DENIED/EXPIRED.
+  //
+  pub let LPX_SEED_SLOT_ELEVATE_EP : u64 = 5
+  pub let mut umnt_elev_broker_slot : u64 = uninit @align(8)
 
   // ==========================================================================
   // elevate_request_force_unmount(mount_id) -> u64
@@ -110,12 +150,24 @@ module Elevate = structure {
   //
   // Pure leaf, no branches, no nested call, no push/pop.
   // ==========================================================================
-  pub let elevate_request_force_unmount : (u64) -> u64 !{} @{} =
+  pub let elevate_request_force_unmount : (u64) -> u64 !{mem} @{} =
     fn (mount_id: u64) -> unsafe {
-      effects: {}, capabilities: {},
-      justification: "umount.pdxfs.M3-002 (#8): elevate_request_force_unmount entry point. mount_id (rdi) is accepted but READ BY NOTHING in this landing's body -- see module header for why no real elevate_client_acquire/elevate_client_require call can be honestly constructed yet (no broker-endpoint cap in this tool's caps.decl). `mov rax, 0` (ELEV_DENY) unconditionally; `ret`. Pure leaf -- no push/pop, no `add reg,[mem]`, no `test`. No labels needed (no branch).",
+      effects: {mem}, capabilities: {},
+      justification: "umount.pdxfs.M3-002 (#8) + PFS-15 (paideia-os#2582): elevate_request_force_unmount entry point. PFS-15 rewrite reuses mount.pdxfs's mint_wire pattern (src/mint_wire.pdx `mount_mw_elevate_slot`): read [rip+umnt_elev_broker_slot] into rax; cmp rax,0; je umnt_elev_force_no_slot -> `mov rax, 2` (ELEV_NO_SLOT); ret. Nonzero slot: ELEV_GRANT (1) today -- the real body would issue libpdx-elevate's elevate_client_acquire for (KIND_VOLUME, R_VOL_REVOKE, mount_id) and branch APPROVED/DENIED/EXPIRED, but PFS-02's kernel-side seed enablement is still open, so no slot is ever provisioned at this landing and the GRANT arm is unreachable. mount_id (rdi) is accepted and read into r11 only so a future real elevate_client_acquire has it in a callee-save slot (per mint_wire's own `rbx = dev_cap` convention); no push/pop needed because r11 is caller-save and the only nested work (future-elevate call) runs on the GRANT arm which rewrites r11 anyway. Pure leaf today. No `add reg,[mem]`, no `test`. Labels prefixed umnt_elev_force_.",
       block: {
-        mov rax, 0;                          // ELEV_DENY (fail-closed; see module header)
+        mov r11, rdi;                        // mount_id (reserved for future elevate_client_acquire)
+        mov rax, [rip + umnt_elev_broker_slot];
+        cmp rax, 0;
+        je umnt_elev_force_no_slot;
+
+        // Slot provisioned -> ELEV_GRANT today (unreachable at this
+        // landing; see module header for the real elevate_client_acquire
+        // sequence that replaces this body once PFS-02 seeds the slot).
+        mov rax, 1;                          // ELEV_GRANT
+        ret;
+
+      umnt_elev_force_no_slot:
+        mov rax, 2;                          // ELEV_NO_SLOT (fail-closed; the only reachable value)
         ret;
       }
     }

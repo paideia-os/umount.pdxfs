@@ -1,8 +1,8 @@
 # umount.pdxfs — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M5 (signed release) — **landed**
-**Version:** 1.1.2 (ENH-030: libpdx-argv adoption — replaces handwritten scanner, #23)
+**Current milestone:** M5 (signed release) — **landed**; PFS AISSUE wave in flight.
+**Version:** 1.2.0 (PFS-15: `--force` end-to-end + `--lazy` DEFERRED documented, paideia-os#2582)
 
 See `design/tooling/volume-tooling-ux.md` §9.3 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -268,12 +268,33 @@ repo's remaining work:
    `mldsa65_verify` landed in paideia-as); closes every `UO_STUB_*`
    mask bit except LAZY_DEFERRED and ELEVATION_DENIED.  Depends on
    PFS-04 (cross-repo paideia-as), PFS-13.
-3. **PFS-15 — `--force` + `--lazy` end-to-end.**
-   `elevate_request_force_unmount` real body (consumes PFS-02's
-   `KIND_ELEVATE_CHANNEL` broker-endpoint cap); `--lazy` DEFERRED
-   completion record on last-handle-close (user-space poll loop per
-   sys-mount-abi.md §7-5; kernel-side finaliser is post-PFS scope).
-   Depends on PFS-02, PFS-13.
+3. **PFS-15 — `--force` end-to-end + `--lazy` DEFERRED documented**
+   (paideia-os#2582) — **landed 2026-10-13, v1.2.0.**
+   `elevate_request_force_unmount` rewritten over the mint_wire
+   pattern (`.bss umnt_elev_broker_slot` seeded by PFS-02 slot 5,
+   zero-defaulted); `handle_check_query` issues a real
+   `cap_invoke(VOL_OP_QUERY_HANDLE_COUNT=10)` on a nonzero
+   `umnt_vol_cap_slot`; `unmount_op`'s ELEV_GRANT arm runs a real
+   per-handle revoke sweep against the NEW kernel-side op
+   `VOL_OP_REVOKE_HANDLE` (ordinal 11, `R_VOL_REVOKE`-gated, carries
+   the index in `op_arg[63:8]`). Two new exit codes
+   (`UMOUNT_ERR_NO_ELEVATE` = 10, `UMOUNT_ERR_REVOKE_FAIL` = 11)
+   surface the fail-closed arm reachable today. `--lazy`
+   DEFERRED-completion record is DEFERRED to a follow-up (user-space
+   poll loop per `sys-mount-abi.md` §7-5; kernel-side finaliser is
+   post-PFS scope): no `sys_umount` completion-notify primitive
+   exists, and `KIND_PDXFS_MOUNT_TABLE`'s row layout has no
+   `PENDING_UNMOUNT` flag to key a poll off, so a real completion
+   record would need either a kernel-side callback-registration ABI
+   OR a user-space polling loop against a mount-table row-is-gone
+   predicate — neither has substrate at this landing. The
+   `UO_RC_DEFERRED` arm still correctly emits the mid-lifecycle
+   "scheduled" record on the first unmount, matching the behaviour
+   `tests/test_lazy_deferred.pdx` asserts.
+   Depends on PFS-02 (kernel-side enablement open — the only
+   reachable `--force` arm today is `UMOUNT_ERR_NO_ELEVATE`), PFS-13
+   (follow-up: path-indexed slot lookup to populate
+   `umnt_vol_cap_slot` from a mount-table walk).
 
    **PFS-02 seed convention landed as design doc at paideia-os
    `design/pdxfs/init-caps-seed-convention.md` (2026-10-11)** —

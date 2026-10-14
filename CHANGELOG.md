@@ -1,5 +1,86 @@
 # umount.pdxfs — CHANGELOG
 
+## 1.2.0 — 2026-10-13 (PFS-15: `--force` end-to-end + `--lazy` DEFERRED documented)
+
+**Minor bump — two new exit codes (10, 11) + two new `result_code`
+words (`NO_ELEVATE`, `REVOKE_FAIL`); every previously documented exit
+code and `result_code` word keeps its numeric value and spelling.**
+Wires `--force` end-to-end against the PFS-02 `_init_caps` seed
+convention (`design/pdxfs/init-caps-seed-convention.md` §2.3 in the
+paideia-os repo): the elevate call becomes a real broker-slot lookup
+over the mint_wire pattern (`src/mint_wire.pdx` in mount.pdxfs), the
+handle-count query becomes a real `cap_invoke` against VOL_OP_QUERY_
+HANDLE_COUNT (op 10), and the ELEV_GRANT revoke sweep becomes a real
+per-index loop against the NEW kernel-side op `VOL_OP_REVOKE_HANDLE`
+(op 11). `--lazy` DEFERRED remains a documented stub (no last-handle-
+close kernel callback exists; `src/unmount_op.pdx`'s own module header
+documents the gap).
+
+### Added
+
+- **`src/elevate.pdx`** — `elevate_request_force_unmount` now
+  consults a .bss `umnt_elev_broker_slot` sentinel (seeded by PFS-02
+  slot 5, zero until kernel-side enablement lands); zero -> new
+  `ELEV_NO_SLOT` (2); nonzero -> `ELEV_GRANT` (1, pending the real
+  libpdx-elevate call sequence documented in the file header).
+- **`src/handle_check.pdx`** — `handle_check_query` now issues a real
+  `cap_invoke(umnt_vol_cap_slot, 10)` via SC+ ID 4 when the .bss
+  cap-slot sentinel is nonzero; zero slot still returns 0 (fail-safe,
+  the only reachable value today). Function effects grew to `{mem,
+  sysreg}` and capabilities to `{cap}`.
+- **`src/unmount_op.pdx`** — ELEV_GRANT arm runs a real
+  `VOL_OP_REVOKE_HANDLE` sweep: iterate `handle_count` iterations,
+  each `cap_invoke(vol_slot, (i << 8) | 11)` via SC+ ID 4; any
+  nonzero return aborts to the new `UO_RC_REVOKE_FAIL` (9) arm; full
+  success falls into the normal six-step pipeline with the reclaimed
+  `UO_STUB_HANDLE_REVOKE` (0x80) bit meaning "sweep ran OK, kernel-
+  side body still stubbed per `kind_volume.pdx`'s declaration".
+  Function capabilities grew to `{fs, cap}`.
+- **New `UO_RC_*` codes (`src/unmount_op.pdx`)** — `UO_RC_NO_ELEVATE`
+  (8) and `UO_RC_REVOKE_FAIL` (9); new stub-mask bits
+  `UO_STUB_NO_ELEVATE` (0x200) and `UO_STUB_REVOKE_FAIL` (0x400).
+- **New `UR_RC_*` codes (`src/unmount_record.pdx`)** —
+  `UR_RC_NO_ELEVATE` (8), `UR_RC_REVOKE_FAIL` (9), with the matching
+  `result_code` word literals `NO_ELEVATE` and `REVOKE_FAIL`.
+- **New exit codes (`src/main.pdx`)** — 10 = `UMOUNT_ERR_NO_ELEVATE`
+  (broker-endpoint cap unprovisioned); 11 = `UMOUNT_ERR_REVOKE_FAIL`
+  (per-handle revoke refused mid-sweep).
+- **Kernel-side `src/kernel/core/cap/kind_volume.pdx` (paideia-os
+  main repo)** — `VOL_OP_REVOKE_HANDLE` (ordinal 11) + bumped
+  `VOL_OP_MAX` to 11. Dispatch gate updated: op 11 is the UNIQUE op
+  in the catalog that carries a nonzero `op_arg[63:8]` (the per-
+  handle index); every other op still refuses one. Op body is a
+  stub-success (returns `VOL_OK`) pending real per-row handle
+  tracking (same gap `VOL_OP_QUERY_HANDLE_COUNT` already documents).
+  Needs `R_VOL_REVOKE` (0x010), distinct from `R_VOL_INVOKE` (0x008).
+
+### Deferred
+
+- **`--lazy` DEFERRED completion** — `src/unmount_op.pdx`'s
+  `UO_RC_DEFERRED` arm still emits only the mid-lifecycle
+  "scheduled" record; the "last handle closed, deferred unmount
+  completed" follow-up record is not emitted. No per-handle
+  completion callback exists kernel-side (there is no
+  `sys_umount` completion-notify primitive and no `PENDING_UNMOUNT`
+  flag anywhere in `KIND_PDXFS_MOUNT_TABLE`'s real row layout), so
+  a real completion record would need either (a) a kernel-side
+  callback-registration ABI or (b) a user-space poll loop over the
+  mount table waiting for the row to disappear (the posture
+  `STATUS.md` PFS-15's own entry describes as "post-PFS scope"
+  per `sys-mount-abi.md` §7-5).
+
+### Behaviour change (tests + operator-visible)
+
+- `tests/test_force_revoke.pdx` updated to assert the PFS-15
+  reachable fail-closed arm (`ELEV_NO_SLOT` -> `UO_RC_NO_ELEVATE` ->
+  `UO_STUB_NO_ELEVATE` + exit 10) rather than the pre-PFS-15 arm
+  (`ELEV_DENY` -> `UO_RC_ELEVATION_STUB` -> `UO_STUB_ELEVATION_
+  DENIED` + exit 7). The pre-PFS-15 arm remains wired and
+  reachable the day PFS-02's kernel-side cap seed lands.
+
+Closes paideia-os#2582. Depends on PFS-02 kernel-side enablement (not
+yet landed) to reach anything beyond the `UO_RC_NO_ELEVATE` arm.
+
 ## 1.1.2 — 2026-09-02 (ENH-030: libpdx-argv adoption — replaces handwritten scanner)
 
 **Patch bump — no observable behaviour change for well-formed input;
